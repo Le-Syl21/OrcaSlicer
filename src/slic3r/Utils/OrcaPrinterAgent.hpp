@@ -9,6 +9,8 @@
 
 namespace Slic3r {
 
+class OrcaCloudServiceAgent;
+
 /**
  * OrcaPrinterAgent - Stub implementation for printer operations.
  *
@@ -81,6 +83,12 @@ private:
     std::string log_dir;
     std::string selected_machine;
     std::shared_ptr<ICloudServiceAgent> m_cloud_agent;
+    OrcaCloudServiceAgent* m_orca_cloud = nullptr;   // == m_cloud_agent.get() when the Orca provider is active
+
+    // MOCK: OrcaCloud does not yet relay the printer's info.get_version reply, so
+    // synthesize it and feed it through on_message_fn (same sink as real report
+    // messages). Delete once the backend answers info.get_version.
+    void deliver_mock_get_version(const std::string& dev_id);
 
     // Callbacks
     OnMsgArrivedFn on_ssdp_msg_fn;

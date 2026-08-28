@@ -494,7 +494,7 @@ public:
     bool            check_login(const std::string& provider = ORCA_CLOUD_PROVIDER);
     void            get_login_info(const std::string& provider = ORCA_CLOUD_PROVIDER);
     bool            is_user_login(const std::string& provider = ORCA_CLOUD_PROVIDER);
-    const std::string& get_printer_cloud_provider() const;
+    std::string      get_printer_cloud_provider() const;
 
     void            request_user_login(int online_login = 0, const std::string& provider = ORCA_CLOUD_PROVIDER);
     void            request_user_handle(int online_login = 0, const std::string& provider = ORCA_CLOUD_PROVIDER);

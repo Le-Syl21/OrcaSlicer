@@ -572,6 +572,19 @@ namespace Slic3r
             << " cur_selected=" << selected_machine;
         auto my_machine_list = get_my_machine_list();
         auto it = my_machine_list.find(dev_id);
+        BOOST_LOG_TRIVIAL(info) << "Orca diagnostic: set_selected_machine lookup dev_id=" << dev_id
+                                << " found=" << (it != my_machine_list.end())
+                                << " my_machine_count=" << my_machine_list.size()
+                                << " current_agent=" << get_current_printer_agent_id()
+                                << " provider=" << GUI::wxGetApp().get_printer_cloud_provider();
+        if (it != my_machine_list.end() && it->second) {
+            BOOST_LOG_TRIVIAL(info) << "Orca diagnostic: target machine dev_id=" << it->second->get_dev_id()
+                                    << " printer_agent_id=" << it->second->printer_agent_id
+                                    << " connection_type=" << it->second->connection_type()
+                                    << " dev_connection_type=" << it->second->dev_connection_type;
+        } else {
+            BOOST_LOG_TRIVIAL(warning) << "Orca diagnostic: target machine was not found in the current agent's machine list";
+        }
 
         // disconnect last if dev_id difference from previous one
         auto last_selected = my_machine_list.find(selected_machine);
@@ -582,7 +595,9 @@ namespace Slic3r
                 m_agent->disconnect_printer();
             }
             else if (last_selected->second->connection_type() == "cloud") {
-                m_agent->set_user_selected_machine("");
+                const int result = m_agent->set_user_selected_machine("");
+                BOOST_LOG_TRIVIAL(info) << "Orca diagnostic: cleared previous cloud selection dev_id="
+                                        << selected_machine << " result=" << result;
             }
         }
 
@@ -634,7 +649,9 @@ namespace Slic3r
                     {
                         // diff dev_id, cloud => set_user_selected_machine(new)
                         BOOST_LOG_TRIVIAL(info) << "set_selected_machine: select new cloud machine, dev_id =" << dev_id;
-                        m_agent->set_user_selected_machine(dev_id);
+                        const int result = m_agent->set_user_selected_machine(dev_id);
+                        BOOST_LOG_TRIVIAL(info) << "Orca diagnostic: set new cloud selection dev_id="
+                                                << dev_id << " result=" << result;
                         it->second->reset();
                     }
                     else
@@ -662,6 +679,8 @@ namespace Slic3r
 
         selected_machine = dev_id;
         record_user_last_machine(selected_machine);
+        BOOST_LOG_TRIVIAL(info) << "Orca diagnostic: DeviceManager selection complete selected_machine="
+                                << selected_machine;
         return true;
     }
 
@@ -692,7 +711,9 @@ namespace Slic3r
             dev_list.push_back(it->first);
             BOOST_LOG_TRIVIAL(trace) << "add_user_subscribe: " << it->first;
         }
-        m_agent->add_subscribe(dev_list);
+        const int result = m_agent->add_subscribe(dev_list);
+        BOOST_LOG_TRIVIAL(info) << "Orca diagnostic: add_user_subscribe count=" << dev_list.size()
+                                << " result=" << result;
     }
 
 
@@ -705,7 +726,9 @@ namespace Slic3r
             dev_list.push_back(it->first);
             BOOST_LOG_TRIVIAL(trace) << "del_user_subscribe: " << it->first;
         }
-        m_agent->del_subscribe(dev_list);
+        const int result = m_agent->del_subscribe(dev_list);
+        BOOST_LOG_TRIVIAL(info) << "Orca diagnostic: del_user_subscribe count=" << dev_list.size()
+                                << " result=" << result;
     }
 
     void DeviceManager::subscribe_device_list(std::vector<std::string> dev_list)
@@ -869,6 +892,12 @@ namespace Slic3r
 
                     if (!obj) continue;
 
+                    // Orca cloud printers are only ever delivered through this REST
+                    // account list; tag them so DeviceManager's cloud/lan branches
+                    // (subscribe + deselect in set_selected_machine) treat them right.
+                    if (provider == "orca")
+                        obj->dev_connection_type = "cloud";
+
                     if (!elem["dev_id"].is_null())
                         obj->set_dev_id(elem["dev_id"].get<std::string>());
                     if (!elem["dev_name"].is_null())
@@ -900,6 +929,12 @@ namespace Slic3r
                         acc_code.erase(std::remove(acc_code.begin(), acc_code.end(), '\n'), acc_code.end());
                         obj->set_access_code(acc_code);
                     }
+
+                    BOOST_LOG_TRIVIAL(info) << "Orca diagnostic: parsed cloud machine dev_id=" << dev_id
+                                            << " name=" << obj->get_dev_name()
+                                            << " agent_id=" << obj->printer_agent_id
+                                            << " connection_type=" << obj->connection_type()
+                                            << " online=" << obj->m_is_online;
                 }
 
                 //remove MachineObject from userMachineList
@@ -915,6 +950,9 @@ namespace Slic3r
                         iterat++;
                     }
                 }
+                BOOST_LOG_TRIVIAL(info) << "Orca diagnostic: parse_user_print_info complete provider=" << provider
+                                        << " parsed_count=" << new_list.size()
+                                        << " stored_count=" << userMachineList.size();
             }
         }
         catch (std::exception& e)
@@ -931,10 +969,14 @@ namespace Slic3r
         unsigned int http_code;
         std::string body;
         int result = m_agent->get_user_print_info(&http_code, &body, provider);
+        BOOST_LOG_TRIVIAL(info) << "Orca diagnostic: get_user_print_info provider=" << provider
+                                << " result=" << result << " http_code=" << http_code
+                                << " body_bytes=" << body.size();
         if (result == 0)
         {
             // parse_user_print_info and on_machine_alive (SSDP for discovery) both mutate the same userMachineList map.
             // on_machine_alive mutates the map on the UI thread, do the same for parse_user_print_info.
+            BOOST_LOG_TRIVIAL(info) << "Orca diagnostic: queueing parse_user_print_info on UI thread";
             Slic3r::GUI::wxGetApp().CallAfter([this, body]() { parse_user_print_info(body); });
         }
     }

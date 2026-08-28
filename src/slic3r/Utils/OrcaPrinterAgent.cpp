@@ -1,5 +1,8 @@
 #include "OrcaPrinterAgent.hpp"
 #include "NetworkAgentFactory.hpp"
+#include "OrcaCloudServiceAgent.hpp"
+#include <boost/log/trivial.hpp>
+#include <thread>
 
 namespace Slic3r {
 
@@ -13,8 +16,35 @@ OrcaPrinterAgent::~OrcaPrinterAgent() = default;
 
 void OrcaPrinterAgent::set_cloud_agent(std::shared_ptr<ICloudServiceAgent> cloud)
 {
-    std::lock_guard<std::mutex> lock(state_mutex);
-    m_cloud_agent = cloud;
+    BOOST_LOG_TRIVIAL(info) << "OrcaPrinterAgent::set_cloud_agent: cloud=" << (cloud ? cloud->get_id() : "<null>");
+    {
+        std::lock_guard<std::mutex> lock(state_mutex);
+        m_cloud_agent = cloud;
+        m_orca_cloud  = dynamic_cast<OrcaCloudServiceAgent*>(cloud.get());
+    }
+    if (!m_orca_cloud) {
+        BOOST_LOG_TRIVIAL(warning) << "OrcaPrinterAgent::set_cloud_agent: cloud is not OrcaCloudServiceAgent";
+        return;   // BBL provider active - nothing to bridge
+    }
+
+    // OrcaCloudServiceAgent owns the aggregate MQTT socket; it already strips the
+    // device/<id>/report topic and hands us (dev_id, raw_json). Forward to the
+    // standard sink. message_arrive_fn self-marshals to the UI thread via CallAfter,
+    // so being called from the MQTT worker thread is fine.
+    const int callback_result = m_orca_cloud->set_printer_status_callback([this](std::string dev_id, std::string payload) {
+        BOOST_LOG_TRIVIAL(info) << "OrcaPrinterAgent: received cloud status dev_id=" << dev_id
+                                << " payload_bytes=" << payload.size();
+        OnMessageFn fn;
+        {
+            std::lock_guard<std::mutex> lock(state_mutex);
+            fn = on_message_fn;
+        }
+        if (fn)
+            fn(std::move(dev_id), std::move(payload));
+        else
+            BOOST_LOG_TRIVIAL(warning) << "OrcaPrinterAgent: cloud status has no registered on_message callback";
+    });
+    BOOST_LOG_TRIVIAL(info) << "OrcaPrinterAgent::set_cloud_agent: status callback result=" << callback_result;
 }
 
 // ============================================================================
@@ -23,6 +53,34 @@ void OrcaPrinterAgent::set_cloud_agent(std::shared_ptr<ICloudServiceAgent> cloud
 
 int OrcaPrinterAgent::send_message(std::string dev_id, std::string json_str, int qos, int flag)
 {
+    (void) qos;
+    (void) flag;   // MQTT concepts; N/A for the REST command endpoint
+
+    std::shared_ptr<ICloudServiceAgent> cloud;
+    {
+        std::lock_guard<std::mutex> lock(state_mutex);
+        cloud = m_cloud_agent;
+    }
+    BOOST_LOG_TRIVIAL(info) << "OrcaPrinterAgent::send_message: dev_id=" << dev_id
+                            << " payload_bytes=" << json_str.size() << " qos=" << qos << " flag=" << flag
+                            << " cloud=" << (cloud ? cloud->get_id() : "<null>");
+    if (!cloud || dev_id.empty()) {
+        BOOST_LOG_TRIVIAL(warning) << "OrcaPrinterAgent::send_message: rejected due to missing cloud or device ID";
+        return BAMBU_NETWORK_ERR_INVALID_HANDLE;
+    }
+
+    // Detached worker so the UI thread is never blocked on HTTP. Capture a shared_ptr
+    // copy (keeps the cloud agent alive) - never `this`.
+    std::thread([cloud, dev_id, body = std::move(json_str)]() {
+        if (auto* orca = dynamic_cast<OrcaCloudServiceAgent*>(cloud.get())) {
+            const int result = orca->send_printer_command(dev_id, body);
+            BOOST_LOG_TRIVIAL(info) << "OrcaPrinterAgent::send_message: cloud command result=" << result
+                                    << " dev_id=" << dev_id;
+        } else {
+            BOOST_LOG_TRIVIAL(error) << "OrcaPrinterAgent::send_message: cloud agent is not OrcaCloudServiceAgent";
+        }
+    }).detach();
+
     return BAMBU_NETWORK_SUCCESS;
 }
 
@@ -123,9 +181,66 @@ std::string OrcaPrinterAgent::get_user_selected_machine()
 
 int OrcaPrinterAgent::set_user_selected_machine(std::string dev_id)
 {
-    std::lock_guard<std::mutex> lock(state_mutex);
-    selected_machine = dev_id;
+    std::shared_ptr<ICloudServiceAgent> cloud;
+    std::string previous;
+    {
+        std::lock_guard<std::mutex> lock(state_mutex);
+        if (dev_id == selected_machine) {
+            BOOST_LOG_TRIVIAL(info) << "OrcaPrinterAgent::set_user_selected_machine: unchanged dev_id=" << dev_id;
+            return BAMBU_NETWORK_SUCCESS;
+        }
+        previous         = selected_machine;
+        selected_machine = dev_id;
+        cloud            = m_cloud_agent;
+    }
+    BOOST_LOG_TRIVIAL(info) << "OrcaPrinterAgent::set_user_selected_machine: previous=" << previous
+                            << " new=" << dev_id << " cloud=" << (cloud ? cloud->get_id() : "<null>");
+    if (!cloud) {
+        BOOST_LOG_TRIVIAL(warning) << "OrcaPrinterAgent::set_user_selected_machine: no cloud agent";
+        return BAMBU_NETWORK_SUCCESS;
+    }
+
+    // One report topic at a time. add_subscribe/del_subscribe only mutate a set and
+    // wake the MQTT worker, so they are safe to call synchronously on the UI thread.
+    if (!previous.empty()) {
+        const int result = cloud->del_subscribe({previous});
+        BOOST_LOG_TRIVIAL(info) << "OrcaPrinterAgent::set_user_selected_machine: unsubscribe dev_id=" << previous
+                                << " result=" << result;
+    }
+    if (!dev_id.empty()) {
+        const int result = cloud->add_subscribe({dev_id});
+        BOOST_LOG_TRIVIAL(info) << "OrcaPrinterAgent::set_user_selected_machine: subscribe dev_id=" << dev_id
+                                << " result=" << result;
+        // Relay retains nothing: ask the printer for a full snapshot. Async inside
+        // send_message; returns immediately.
+        send_message(dev_id,
+            R"({"pushing":{"command":"pushall","sequence_id":"20001","version":1,"push_target":1}})",
+            0, 0);
+        deliver_mock_get_version(dev_id);
+    }
     return BAMBU_NETWORK_SUCCESS;
+}
+
+void OrcaPrinterAgent::deliver_mock_get_version(const std::string& dev_id)
+{
+    // The printer would answer an info.get_version request with its firmware/module
+    // list; OrcaCloud does not relay that yet, so MachineObject::module_vers stays
+    // empty and is_info_ready(check_version) never passes (StatusPanel bails, every
+    // field renders N/A). Synthesize the reply and push it through the same sink as
+    // real report messages so parse_json handles it identically. Remove once the
+    // backend answers info.get_version on device/<id>/report.
+    OnMessageFn fn;
+    {
+        std::lock_guard<std::mutex> lock(state_mutex);
+        fn = on_message_fn;
+    }
+    if (!fn)
+        return;
+    static const std::string kMockGetVersion =
+        R"({"info":{"command":"get_version","sequence_id":"0","module":[)"
+        R"({"name":"ota","product_name":"OrcaCloud Printer","hw_ver":"","sw_ver":"01.00.00.00","sn":""}]}})";
+    BOOST_LOG_TRIVIAL(info) << "OrcaPrinterAgent: delivering mock info.get_version for dev_id=" << dev_id;
+    fn(dev_id, kMockGetVersion);
 }
 
 // ============================================================================
@@ -197,6 +312,7 @@ int OrcaPrinterAgent::set_on_message_fn(OnMessageFn fn)
 {
     std::lock_guard<std::mutex> lock(state_mutex);
     on_message_fn = fn;
+    BOOST_LOG_TRIVIAL(info) << "OrcaPrinterAgent::set_on_message_fn: callback=" << (fn ? "set" : "clear");
     return BAMBU_NETWORK_SUCCESS;
 }
 
