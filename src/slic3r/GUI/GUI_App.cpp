@@ -4971,11 +4971,12 @@ bool GUI_App::is_user_login(const std::string& provider/* = ORCA_CLOUD_PROVIDER*
     return false;
 }
 
-const std::string& GUI_App::get_printer_cloud_provider() const
+std::string GUI_App::get_printer_cloud_provider() const
 {
-    // Orca todo: this need to be revisted. currently it is mainly used for device manager and related clausses and only bambu machines use them.
-    // 
-    return BBL_CLOUD_PROVIDER;
+    std::string provider = preset_bundle->printers.get_edited_preset().config.opt_string("printer_agent");
+    if (provider.empty())
+        provider = ORCA_CLOUD_PROVIDER;
+    return provider;
 }
 
 

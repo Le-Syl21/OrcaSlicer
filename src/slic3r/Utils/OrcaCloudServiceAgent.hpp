@@ -2,6 +2,12 @@
 #define __ORCA_CLOUD_SERVICE_AGENT_HPP__
 
 #include "ICloudServiceAgent.hpp"
+
+#include <boost/asio.hpp>
+#include <boost/asio/ssl.hpp>
+#include <boost/beast/core.hpp>
+#include <boost/beast/ssl.hpp>
+#include <boost/beast/websocket.hpp>
 #include <cstdlib>
 #include <string>
 #include <map>
@@ -9,6 +15,9 @@
 #include <atomic>
 #include <chrono>
 #include <functional>
+#include <condition_variable>
+#include <cstdint>
+#include <set>
 #include <memory>
 #include <thread>
 #include <unordered_map>
@@ -21,6 +30,78 @@ namespace Slic3r {
 
 // Forward declarations
 class AppConfig;
+// MQTT 3.1.1 over the aggregate WebSocket is deliberately kept here instead
+// of using the printer SDK. The endpoint is a read-only status stream; MQTT
+// PUBLISH must never be sent on it because the cloud closes such sessions.
+class OrcaCloudMqttConnection
+{
+public:
+    using TokenProvider  = std::function<std::string()>;
+    using MessageHandler = std::function<void(const std::string&, const std::string&)>;
+    using StateHandler   = std::function<void(bool connected, bool initial)>;
+
+    ~OrcaCloudMqttConnection();
+
+    bool start(const std::string& endpoint, TokenProvider token_provider, MessageHandler message_handler, StateHandler state_handler);
+    void stop();
+    // True while the worker thread is alive (connected OR retrying). Lets callers
+    // avoid restarting a healthy connection.
+    bool is_running() const;
+    // True once CONNACK has been received and the socket has not since dropped.
+    bool is_connected() const { return connected.load(); }
+    bool subscribe(const std::vector<std::string>& device_ids);
+    bool unsubscribe(const std::vector<std::string>& device_ids);
+    void clear_subscriptions();
+
+private:
+    struct Endpoint { std::string host; std::string port; std::string target; };
+    using WebSocket = boost::beast::websocket::stream<
+        boost::asio::ssl::stream<boost::beast::tcp_stream>>;
+    struct Connection;
+
+    static bool parse_endpoint(const std::string& url, Endpoint& endpoint);
+    static void append_string(std::vector<uint8_t>& packet, const std::string& value);
+    static void prepend_remaining_length(std::vector<uint8_t>& packet, size_t length);
+    static std::vector<uint8_t> make_connect_packet();
+    static std::string report_topic(const std::string& device_id);
+    static std::vector<uint8_t> make_topic_packet(uint8_t type, uint16_t packet_id, const std::vector<std::string>& device_ids);
+    static std::vector<uint8_t> make_ping_packet();
+
+    void send(WebSocket& websocket, const std::vector<uint8_t>& packet);
+    // Emit a queued SUBSCRIBE/UNSUBSCRIBE on the live socket right now (from the
+    // caller thread), so a selection change is applied without waiting for the
+    // blocking read loop to next return. No-op if no CONNACKed socket exists yet
+    // (the worker sends the set on connect). The aggregate viewer is dynamic — the
+    // WebSocket is never dropped for a subscription change.
+    void flush_subscription_change();
+    void connect_and_read();
+    void send_current_subscriptions(WebSocket& websocket);
+    void send_pending_subscriptions(WebSocket& websocket);
+    void handle_packet(const std::string& packet);
+    void notify_state(bool is_now_connected);
+    void run();
+
+    std::atomic_bool stopping{true};
+    std::atomic_int reconnect_delay_seconds{1};
+    std::thread worker;
+    std::mutex mutex;
+    std::mutex connection_mutex;
+    std::mutex write_mutex; // serialises every websocket write (worker + caller threads)
+    std::shared_ptr<Connection> active_connection;
+    std::condition_variable initial_cv;
+    std::condition_variable state_cv;
+    std::string endpoint_url;
+    TokenProvider get_token;
+    MessageHandler on_message;
+    StateHandler on_state;
+    std::set<std::string> subscriptions;
+    std::set<std::string> pending_subscriptions;
+    std::set<std::string> pending_unsubscriptions;
+    std::atomic<uint16_t> next_packet_id{1};
+    bool initial_result{false};
+    bool initial_completed{false};
+    std::atomic_bool connected{false};
+};
 struct BundleMetadata;
 struct PluginDescriptor;
 struct PluginChangelog;
@@ -206,6 +287,18 @@ public:
     int add_subscribe(std::vector<std::string> dev_list) override;
     int del_subscribe(std::vector<std::string> dev_list) override;
     void enable_multi_machine(bool enable) override;
+
+    // The aggregate printer socket is status-only. OrcaPrinterAgent registers
+    // its normal message callback here and adds/removes device report topics
+    // through add_subscribe()/del_subscribe(). Printer commands continue to
+    // use the REST commands endpoint; they must never be published here.
+    int set_printer_status_callback(OnMessageFn fn);
+
+    // Send a Bambu-dialect command to one printer via the cloud relay's REST
+    // endpoint (POST /api/v1/printers/<id>/commands). Synchronous - wraps http_post,
+    // so it carries the standard apikey + bearer headers and token refresh. Callers
+    // that need non-blocking behaviour run it on their own thread.
+    int send_printer_command(const std::string& dev_id, const std::string& body);
 
     // ========================================================================
     // ICloudServiceAgent Interface Implementation - Settings Synchronization
@@ -423,6 +516,7 @@ private:
                                std::chrono::system_clock::now().time_since_epoch()).count()};
 
     // Member variables - connection state
+    std::unique_ptr<OrcaCloudMqttConnection> mqtt_connection;
     bool is_connected{false};
     bool enable_track{false};
     bool multi_machine_enabled{false};
@@ -436,6 +530,7 @@ private:
     AppOnHttpErrorFn on_http_error_fn;
     GetCountryCodeFn get_country_code_fn;
     QueueOnMainFn queue_on_main_fn;
+    OnMessageFn printer_status_callback;
     mutable std::mutex callback_mutex;
 
     // Thread safety
