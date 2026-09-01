@@ -102,14 +102,14 @@ public:
     CameraStreamMode get_camera_stream_mode() const override
     {
         ORCA_PY_OVERRIDE_AUDITED(
-            ::Slic3r::PluginAuditManager::AuditMode::Loading, [] {}, PYBIND11_OVERRIDE_PURE, CameraStreamMode, PrinterAgentPluginCapability,
+            [] {}, PYBIND11_OVERRIDE_PURE, CameraStreamMode, PrinterAgentPluginCapability,
             get_camera_stream_mode);
     }
 
     std::string get_camera_url() const override
     {
         ORCA_PY_OVERRIDE_AUDITED(
-            ::Slic3r::PluginAuditManager::AuditMode::Loading, [] {}, PYBIND11_OVERRIDE_PURE, std::string, PrinterAgentPluginCapability, get_camera_url);
+            [] {}, PYBIND11_OVERRIDE_PURE, std::string, PrinterAgentPluginCapability, get_camera_url);
     }
 
     bool fetch_filament_info(std::string dev_id, FilamentSyncMode sync_mode = FilamentSyncMode::pull) override

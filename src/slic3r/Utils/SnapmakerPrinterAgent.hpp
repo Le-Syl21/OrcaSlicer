@@ -20,7 +20,6 @@ public:
 
     bool fetch_filament_info(std::string dev_id, FilamentSyncMode sync_mode = FilamentSyncMode::pull) override;
     FilamentSyncMode get_filament_sync_mode() const override;
-    int connect_printer(std::string dev_id, std::string dev_ip, std::string username, std::string password, bool use_ssl) override;
     int command_start_camera(std::string dev_id) override;
     CameraStreamMode get_camera_stream_mode() const override { return CameraStreamMode::http_snapshot; }
     std::string get_camera_url() const override { return device_info.base_url + "/server/files/camera/monitor.jpg"; }
