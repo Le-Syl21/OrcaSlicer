@@ -15,7 +15,6 @@
 #include <wx/gbsizer.h>
 #include <wx/webrequest.h>
 #include <chrono>
-#include "wxMediaCtrl2.h"
 #include "MediaPlayCtrl.h"
 #include "AMSSetting.hpp"
 #include "Calibration.hpp"
@@ -196,11 +195,11 @@ public:
     void      set_cloud_bitmap(std::vector<std::string> cloud_bitmaps);
 
 protected:
-    enum StatusCode { 
-        UPLOAD_PROGRESS = 0, 
-        UPLOAD_EXIST_ISSUE, 
+    enum StatusCode {
+        UPLOAD_PROGRESS = 0,
+        UPLOAD_EXIST_ISSUE,
         UPLOAD_IMG_FAILED,
-        CODE_NUMBER 
+        CODE_NUMBER
     };
 
     std::shared_ptr<int>     m_tocken;
@@ -218,7 +217,7 @@ protected:
     {
         wxString          local_image_url; //local image path
         std::string       img_url_paths; // oss url path
-        vector<wxPanel *> image_broad; 
+        vector<wxPanel *> image_broad;
         bool              is_selected;
         bool              is_uploaded; // load
         wxBoxSizer *      image_tb_broad = nullptr;
@@ -253,7 +252,7 @@ protected:
     std::set<std::pair<wxStaticBitmap *, wxString>>        add_need_upload_imgs();
     std::pair<wxStaticBitmap *, ImageMsg>                  create_local_thumbnail(wxString &local_path);
     std::pair<wxStaticBitmap *, ImageMsg>                  create_oss_thumbnail(std::string &oss_path);
-    
+
 };
 
 class PrintingTaskPanel : public wxPanel
@@ -262,7 +261,7 @@ public:
     PrintingTaskPanel(wxWindow* parent, PrintingTaskType type);
     ~PrintingTaskPanel();
     void create_panel(wxWindow* parent);
-    
+
 
 private:
     MachineObject*  m_obj{nullptr};
@@ -354,7 +353,7 @@ public:
     void set_plate_index(int plate_idx = -1);
     void market_scoring_show();
     void market_scoring_hide();
-    
+
 public:
     ScalableButton* get_abort_button() {return m_button_abort;};
     ScalableButton* get_pause_resume_button() {return m_button_pause_resume;};
@@ -444,7 +443,7 @@ protected:
     wxStaticBitmap* m_camera_switch_button;
 
 
-    wxMediaCtrl2 *  m_media_ctrl;
+    wxMediaCtrl3 *  m_media_ctrl;
     MediaPlayCtrl * m_media_play_ctrl;
 
     Label *         m_staticText_printing;
@@ -568,7 +567,7 @@ protected:
     virtual void on_bed_temp_kill_focus(wxFocusEvent &event) { event.Skip(); }
     virtual void on_bed_temp_set_focus(wxFocusEvent &event) { event.Skip(); }
     virtual void on_nozzle_temp_kill_focus(wxFocusEvent &event) { event.Skip(); }
-    virtual void on_nozzle_temp_set_focus(wxFocusEvent &event) { event.Skip(); }    
+    virtual void on_nozzle_temp_set_focus(wxFocusEvent &event) { event.Skip(); }
     virtual void on_nozzle_fan_switch(wxCommandEvent &event) { event.Skip(); }
     virtual void on_printing_fan_switch(wxCommandEvent &event) { event.Skip(); }
     virtual void on_axis_ctrl_z_up_10(wxCommandEvent &event) { event.Skip(); }
