@@ -11,6 +11,9 @@
 #define ORCA_NETWORK_ERR_CAP_NOT_AVAILABLE -7020 // a translation exists; this printer lacks the capability
 #include <string>
 #include <memory>
+#include <vector>
+#include <functional>
+#include <cstdint>
 
 #if 1
 
@@ -130,6 +133,26 @@ public:
     { return ORCA_NETWORK_ERR_CMD_NOT_SUPPORTED; }
     virtual int command_start_camera(std::string)
     { return ORCA_NETWORK_ERR_CMD_NOT_SUPPORTED; }
+
+    virtual int command_xyz_abs(std::string dev_id, int sequence_id, bool lan_mode)
+    { return ORCA_NETWORK_ERR_CMD_NOT_SUPPORTED; }
+    virtual int command_auto_leveling(std::string dev_id, int sequence_id, bool lan_mode)
+    { return ORCA_NETWORK_ERR_CMD_NOT_SUPPORTED; }
+    virtual int command_go_home(std::string dev_id, bool is_printing, bool supports_mqtt_homing, int sequence_id, bool lan_mode)
+    { return ORCA_NETWORK_ERR_CMD_NOT_SUPPORTED; }
+    virtual int command_set_bed(std::string dev_id, int temp, bool supports_mqtt_bed_ctrl, int sequence_id, bool lan_mode)
+    { return ORCA_NETWORK_ERR_CMD_NOT_SUPPORTED; }
+    virtual int command_set_nozzle(std::string dev_id, int temp, int sequence_id, bool lan_mode)
+    { return ORCA_NETWORK_ERR_CMD_NOT_SUPPORTED; }
+    virtual int command_axis_control(std::string dev_id, std::string axis, double unit, double input_val, int speed,
+                                      bool is_core_xy, bool supports_mqtt_axis_control, int sequence_id, bool lan_mode)
+    { return ORCA_NETWORK_ERR_CMD_NOT_SUPPORTED; }
+
+    /**
+     * Default LAN account username for this agent's protocol, if it has a fixed one.
+     * Returns an empty string if the agent has no fixed default (e.g. caller must supply one).
+     */
+    virtual std::string default_lan_username() const { return {}; }
 
     /**
      * Establish a direct LAN connection to a printer.

@@ -2061,6 +2061,11 @@ void InputIpAddressDialog::on_text(wxCommandEvent &evt)
     auto str_ip              = m_input_ip->GetTextCtrl()->GetValue();
     auto str_access_code     = m_input_access_code->GetTextCtrl()->GetValue();
 
+    if (str_access_code.IsEmpty()) {
+        str_access_code = "88888888";
+        m_input_access_code->GetTextCtrl()->SetValue(str_access_code);
+    }
+
     auto str_name            = m_input_printer_name->GetTextCtrl()->GetValue().Strip(wxString::both);
     auto str_sn              = m_input_sn->GetTextCtrl()->GetValue().Strip(wxString::both);
     bool invalid_access_code = true;
