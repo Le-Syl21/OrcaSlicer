@@ -46,9 +46,13 @@ wxMediaCtrl3::~wxMediaCtrl3()
     m_thread.join();
 }
 
+static void adjust_frame_size(wxSize& frame, wxSize const& video, wxSize const& window);
+
 void wxMediaCtrl3::Load(wxURI url)
 {
     std::unique_lock<std::mutex> lk(m_mutex);
+    if (m_external)
+        return;
     m_video_size = wxDefaultSize;
     m_error = 0;
     m_url.reset(new wxURI(url));
@@ -58,6 +62,8 @@ void wxMediaCtrl3::Load(wxURI url)
 void wxMediaCtrl3::Play()
 {
     std::unique_lock<std::mutex> lk(m_mutex);
+    if (m_external)
+        return;
     if (m_state != wxMEDIASTATE_PLAYING) {
         m_state = wxMEDIASTATE_PLAYING;
         wxMediaEvent event(wxEVT_MEDIA_STATECHANGED);
@@ -73,6 +79,62 @@ void wxMediaCtrl3::Stop()
     m_url.reset();
     m_frame = wxImage(m_idle_image);
     NotifyStopped();
+    m_cond.notify_all();
+    Refresh();
+}
+
+void wxMediaCtrl3::SetExternalFrame(const wxImage& frame, wxSize videoSize)
+{
+    if (!frame.IsOk())
+        return;
+    {
+        std::unique_lock<std::mutex> lk(m_mutex);
+        if (!m_external)
+            return;
+        m_frame = frame;
+        m_video_size = videoSize.IsFullySpecified() ? videoSize : frame.GetSize();
+        adjust_frame_size(m_frame_size, m_video_size, GetSize());
+    }
+    CallAfter([this] { Refresh(); });
+}
+
+#ifdef _WIN32
+void wxMediaCtrl3::SetExternalFrame(const wxBitmap& frame, wxSize videoSize)
+{
+    if (!frame.IsOk())
+        return;
+    {
+        std::unique_lock<std::mutex> lk(m_mutex);
+        if (!m_external)
+            return;
+        m_frame = frame;
+        m_video_size = videoSize.IsFullySpecified() ? videoSize : frame.GetSize();
+        adjust_frame_size(m_frame_size, m_video_size, GetSize());
+    }
+    CallAfter([this] { Refresh(); });
+}
+#endif
+
+void wxMediaCtrl3::BeginExternalStream()
+{
+    std::unique_lock<std::mutex> lk(m_mutex);
+    m_external = true;
+    m_url.reset();
+    m_active_url.reset();
+    m_video_size = wxDefaultSize;
+    m_frame = wxImage(m_idle_image);
+    m_cond.notify_all();
+    Refresh();
+}
+
+void wxMediaCtrl3::EndExternalStream()
+{
+    std::unique_lock<std::mutex> lk(m_mutex);
+    m_external = false;
+    m_url.reset();
+    m_active_url.reset();
+    m_video_size = wxDefaultSize;
+    m_frame = wxImage(m_idle_image);
     m_cond.notify_all();
     Refresh();
 }

@@ -1,4 +1,5 @@
 #include "OrcaPrinterAgent.hpp"
+#include "OrcaCloudSignalingChannel.hpp"
 #include "NetworkAgentFactory.hpp"
 #include "OrcaCloudServiceAgent.hpp"
 #include <boost/log/trivial.hpp>
@@ -47,6 +48,31 @@ void OrcaPrinterAgent::set_cloud_agent(std::shared_ptr<ICloudServiceAgent> cloud
     BOOST_LOG_TRIVIAL(info) << "OrcaPrinterAgent::set_cloud_agent: status callback result=" << callback_result;
 }
 
+CameraStreamMode OrcaPrinterAgent::get_camera_stream_mode() const
+{
+    std::lock_guard<std::mutex> lock(state_mutex);
+    if (m_lan_connected && !m_lan_rtsp_url.empty())
+        return CameraStreamMode::rtsp;
+    if (m_cloud_agent && m_cloud_agent->is_user_login())
+        return CameraStreamMode::webrtc;
+    return CameraStreamMode::none;
+}
+
+std::string OrcaPrinterAgent::get_camera_url() const
+{
+    std::lock_guard<std::mutex> lock(state_mutex);
+    return m_lan_connected ? m_lan_rtsp_url : std::string{};
+}
+
+std::unique_ptr<ICameraSignalingChannel>
+OrcaPrinterAgent::create_camera_signaling_channel(const std::string& dev_id)
+{
+    std::lock_guard<std::mutex> lock(state_mutex);
+    if (!m_cloud_agent)
+        return nullptr;
+    return std::make_unique<OrcaCloudSignalingChannel>(m_cloud_agent, dev_id);
+}
+
 // ============================================================================
 // Communication - All Stubs
 // ============================================================================
@@ -86,11 +112,20 @@ int OrcaPrinterAgent::send_message(std::string dev_id, std::string json_str, int
 
 int OrcaPrinterAgent::connect_printer(std::string dev_id, std::string dev_ip, std::string username, std::string password, bool use_ssl)
 {
+    std::lock_guard<std::mutex> lock(state_mutex);
+    m_lan_connected = !dev_ip.empty();
+    // OrcaPrinterAgent currently has no LAN status-push decoder. Preserve the
+    // standard OrcaSonar endpoint convention until the reported RTSP field is
+    // available, while keeping the URL behind the connection-aware mode API.
+    m_lan_rtsp_url = m_lan_connected ? "rtsp://" + dev_ip + ":8554/stream" : std::string{};
     return BAMBU_NETWORK_SUCCESS;
 }
 
 int OrcaPrinterAgent::disconnect_printer()
 {
+    std::lock_guard<std::mutex> lock(state_mutex);
+    m_lan_connected = false;
+    m_lan_rtsp_url.clear();
     return BAMBU_NETWORK_SUCCESS;
 }
 

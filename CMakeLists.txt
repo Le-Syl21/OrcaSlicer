@@ -785,6 +785,49 @@ find_package(OpenSSL REQUIRED)
 find_package(CURL REQUIRED)
 find_package(Freetype REQUIRED)
 
+if (SLIC3R_GUI)
+    # LibDataChannel's installed export references its bundled dependencies,
+    # but does not install their CMake targets. Recreate those targets from
+    # the same dependency prefix before loading the LibDataChannel config.
+    if (NOT TARGET Usrsctp::usrsctp)
+        find_library(_ORCA_USRSCTP_LIBRARY NAMES usrsctp
+            PATHS "${CMAKE_PREFIX_PATH}/lib" NO_DEFAULT_PATH)
+        if (_ORCA_USRSCTP_LIBRARY)
+            add_library(Usrsctp::usrsctp UNKNOWN IMPORTED GLOBAL)
+            set_target_properties(Usrsctp::usrsctp PROPERTIES
+                IMPORTED_LOCATION "${_ORCA_USRSCTP_LIBRARY}"
+                IMPORTED_LINK_INTERFACE_LANGUAGES C
+                INTERFACE_LINK_LIBRARIES "Threads::Threads")
+        endif()
+    endif()
+
+    if (NOT TARGET libSRTP::srtp2)
+        find_library(_ORCA_SRTP_LIBRARY NAMES srtp2
+            PATHS "${CMAKE_PREFIX_PATH}/lib" NO_DEFAULT_PATH)
+        if (_ORCA_SRTP_LIBRARY)
+            add_library(libSRTP::srtp2 UNKNOWN IMPORTED GLOBAL)
+            set_target_properties(libSRTP::srtp2 PROPERTIES
+                IMPORTED_LOCATION "${_ORCA_SRTP_LIBRARY}"
+                IMPORTED_LINK_INTERFACE_LANGUAGES C
+                INTERFACE_LINK_LIBRARIES "OpenSSL::Crypto")
+        endif()
+    endif()
+
+    if (NOT TARGET LibJuice::LibJuice)
+        find_library(_ORCA_LIBJUICE_LIBRARY NAMES juice
+            PATHS "${CMAKE_PREFIX_PATH}/lib" NO_DEFAULT_PATH)
+        if (_ORCA_LIBJUICE_LIBRARY)
+            add_library(LibJuice::LibJuice UNKNOWN IMPORTED GLOBAL)
+            set_target_properties(LibJuice::LibJuice PROPERTIES
+                IMPORTED_LOCATION "${_ORCA_LIBJUICE_LIBRARY}"
+                IMPORTED_LINK_INTERFACE_LANGUAGES C
+                INTERFACE_LINK_LIBRARIES "Threads::Threads")
+        endif()
+    endif()
+
+    find_package(LibDataChannel CONFIG REQUIRED)
+endif()
+
 
 add_library(libcurl INTERFACE)
 target_link_libraries(libcurl INTERFACE CURL::libcurl)

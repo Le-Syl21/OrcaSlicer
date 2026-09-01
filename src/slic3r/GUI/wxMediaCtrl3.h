@@ -18,9 +18,7 @@ void wxMediaCtrl_OnSize(wxWindow * ctrl, wxSize const & videoSize, int width, in
 #define BAMBU_DYNAMIC
 #include <condition_variable>
 #include <thread>
-#ifndef _WIN32
 #include <wx/image.h>
-#endif
 #include "Printer/BambuTunnel.h"
 
 class AVVideoDecoder;
@@ -37,6 +35,16 @@ public:
     void Play();
 
     void Stop();
+
+    // Render frames supplied by a controller which owns its own transport.
+    // The frame is copied while m_mutex is held; callers may release it after
+    // this method returns.
+    void SetExternalFrame(const wxImage& frame, wxSize videoSize);
+#ifdef _WIN32
+    void SetExternalFrame(const wxBitmap& frame, wxSize videoSize);
+#endif
+    void BeginExternalStream();
+    void EndExternalStream();
 
     void SetIdleImage(wxString const & image);
 
@@ -77,6 +85,7 @@ private:
 
     std::shared_ptr<wxURI> m_url;
     std::shared_ptr<wxURI> m_active_url;
+    bool m_external = false;
     std::uint64_t m_last_PTS{0};
     std::chrono::system_clock::time_point m_last_PTS_expected;
     std::chrono::system_clock::time_point m_last_PTS_practical;

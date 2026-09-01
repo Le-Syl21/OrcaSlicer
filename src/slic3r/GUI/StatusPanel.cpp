@@ -2317,10 +2317,16 @@ void StatusPanel::update_camera_state(MachineObject* obj)
             m_custom_camera_view->Show();
             m_media_ctrl->Hide();
         }
-    } else if (m_custom_camera_view->IsShown()) {
-        m_custom_camera_view->Hide();
-        m_media_ctrl->Show();
-        m_media_play_ctrl->StopWebStream();
+    } else if (camera_mode == CameraStreamMode::rtsp || camera_mode == CameraStreamMode::webrtc ||
+               m_custom_camera_view->IsShown()) {
+        // Only act on the actual transition away from the webview. Running this
+        // every tick would call StopWebStream() (which forces m_last_state to
+        // IDLE) on a live rtsp/webrtc session and desync the state machine.
+        if (m_custom_camera_view->IsShown()) {
+            m_custom_camera_view->Hide();
+            m_media_ctrl->Show();
+            m_media_play_ctrl->StopWebStream();
+        }
     }
 
     //sdcard

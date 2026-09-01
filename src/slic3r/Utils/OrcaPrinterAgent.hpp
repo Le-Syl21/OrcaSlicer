@@ -27,6 +27,10 @@ public:
     // ========================================================================
 
     void set_cloud_agent(std::shared_ptr<ICloudServiceAgent> cloud) override;
+    CameraStreamMode get_camera_stream_mode() const override;
+    std::string get_camera_url() const override;
+    std::unique_ptr<ICameraSignalingChannel>
+    create_camera_signaling_channel(const std::string& dev_id) override;
 
     // Communication
     int send_message(std::string dev_id, std::string json_str, int qos, int flag) override;
@@ -84,6 +88,9 @@ private:
     std::string selected_machine;
     std::shared_ptr<ICloudServiceAgent> m_cloud_agent;
     OrcaCloudServiceAgent* m_orca_cloud = nullptr;   // == m_cloud_agent.get() when the Orca provider is active
+
+    bool m_lan_connected = false;
+    std::string m_lan_rtsp_url;
 
     // MOCK: OrcaCloud does not yet relay the printer's info.get_version reply, so
     // synthesize it and feed it through on_message_fn (same sink as real report
