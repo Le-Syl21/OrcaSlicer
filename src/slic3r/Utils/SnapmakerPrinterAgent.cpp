@@ -96,15 +96,6 @@ void SnapmakerPrinterAgent::on_status_loop_tick(const std::string& dev_id)
     }
 }
 
-int SnapmakerPrinterAgent::connect_printer(std::string dev_id, std::string dev_ip, std::string username, std::string password, bool use_ssl)
-{
-    const int rtn = MoonrakerPrinterAgent::connect_printer(dev_id, dev_ip, username, password, use_ssl);
-    if (rtn == BAMBU_NETWORK_SUCCESS) {
-        start_camera_monitor();
-    }
-    return rtn;
-}
-
 int SnapmakerPrinterAgent::command_start_camera(std::string dev_id)
 {
     (void) dev_id;
@@ -149,127 +140,139 @@ std::string SnapmakerPrinterAgent::combine_filament_type(const std::string& type
 
 bool SnapmakerPrinterAgent::fetch_filament_info(std::string dev_id, FilamentSyncMode sync_mode)
 {
+    (void) dev_id;
     if (sync_mode != get_filament_sync_mode())
         return false;
 
-    std::string url = join_url(device_info.base_url, "/printer/objects/query?print_task_config&filament_detect");
+    const std::string base_url = device_info.base_url;
+    const std::string api_key  = device_info.api_key;
 
-    std::string response_body;
-    bool        success = false;
-    std::string http_error;
+    filament_fetch_in_flight.fetch_add(1, std::memory_order_relaxed);
 
-    auto http = Http::get(url);
-    if (!device_info.api_key.empty()) {
-        http.header("X-Api-Key", device_info.api_key);
-    }
-    http.timeout_connect(5)
-        .timeout_max(10)
-        .on_complete([&](std::string body, unsigned status) {
-            if (status == 200) {
-                response_body = body;
-                success       = true;
-            } else {
-                http_error = "HTTP error: " + std::to_string(status);
-            }
-        })
-        .on_error([&](std::string body, std::string err, unsigned status) {
-            http_error = err;
-            if (status > 0) {
-                http_error += " (HTTP " + std::to_string(status) + ")";
-            }
-        })
-        .perform_sync();
+    std::thread([this, base_url, api_key]() {
+        struct InFlightGuard
+        {
+            std::atomic<int>& counter;
+            ~InFlightGuard() { counter.fetch_sub(1, std::memory_order_relaxed); }
+        } guard{filament_fetch_in_flight};
 
-    if (!success) {
-        BOOST_LOG_TRIVIAL(warning) << "SnapmakerPrinterAgent::fetch_filament_info: HTTP request failed: " << http_error;
-        return false;
-    }
+        const std::string url = join_url(base_url, "/printer/objects/query?print_task_config&filament_detect");
 
-    auto json = nlohmann::json::parse(response_body, nullptr, false, true);
-    if (json.is_discarded()) {
-        BOOST_LOG_TRIVIAL(warning) << "SnapmakerPrinterAgent::fetch_filament_info: Invalid JSON response";
-        return false;
-    }
+        std::string response_body;
+        bool success = false;
+        std::string http_error;
 
-    // Navigate to result.status.print_task_config
-    if (!json.contains("result") || !json["result"].contains("status") ||
-        !json["result"]["status"].contains("print_task_config")) {
-        BOOST_LOG_TRIVIAL(warning) << "SnapmakerPrinterAgent::fetch_filament_info: Missing print_task_config in response";
-        return false;
-    }
-
-    auto& ptc = json["result"]["status"]["print_task_config"];
-
-    // Read parallel arrays from print_task_config
-    auto filament_exist    = ptc.value("filament_exist", std::vector<bool>{});
-    auto filament_type     = ptc.value("filament_type", std::vector<std::string>{});
-    auto filament_sub_type = ptc.value("filament_sub_type", std::vector<std::string>{});
-    auto filament_color    = ptc.value("filament_color_rgba", std::vector<std::string>{});
-    auto filament_vendor   = ptc.value("filament_vendor", std::vector<std::string>{});
-
-    const int slot_count = static_cast<int>(filament_exist.size());
-    if (slot_count == 0) {
-        BOOST_LOG_TRIVIAL(info) << "SnapmakerPrinterAgent::fetch_filament_info: No filament slots reported";
-        return false;
-    }
-
-    // Read NFC filament_detect data for temperature info (optional)
-    nlohmann::json nfc_info;
-    if (json["result"]["status"].contains("filament_detect") &&
-        json["result"]["status"]["filament_detect"].contains("info")) {
-        nfc_info = json["result"]["status"]["filament_detect"]["info"];
-    }
-
-    static const std::string empty_str;
-    static const std::string default_color = "FFFFFFFF";
-
-    std::vector<AmsTrayData> trays;
-    trays.reserve(slot_count);
-
-    for (int i = 0; i < slot_count; ++i) {
-        AmsTrayData tray;
-        tray.slot_index   = i;
-        tray.has_filament = filament_exist[i];
-
-        if (tray.has_filament) {
-            tray.tray_type     = combine_filament_type(safe_at(filament_type, i, empty_str),
-                                                       safe_at(filament_sub_type, i, empty_str));
-            tray.tray_color    = safe_at(filament_color, i, default_color);
-
-            auto* bundle = GUI::wxGetApp().preset_bundle;
-            // Try to find a matching preset for this filament based on vendor, type and color.
-            // If not found, default to traditional search by type only or generic type mapping.
-            if (bundle) {
-                std::string vendor      = safe_at(filament_vendor, i, empty_str);
-                std::string filament_id = find_closest_color_preset_by_vendor_and_type(bundle->filaments, vendor, tray.tray_type,
-                                                                                       tray.tray_color);
-
-                if (!filament_id.empty()) {
-                    tray.tray_info_idx = filament_id;
-                    BOOST_LOG_TRIVIAL(warning) << "Filament sync: Found manufacturer-specific profile for slot " << i << ": "
-                                               << filament_id;
+        auto http = Http::get(url);
+        if (!api_key.empty()) {
+            http.header("X-Api-Key", api_key);
+        }
+        http.timeout_connect(5)
+            .timeout_max(10)
+            .on_complete([&](std::string body, unsigned status) {
+                if (status == 200) {
+                    response_body = body;
+                    success       = true;
                 } else {
-                    tray.tray_info_idx = bundle->filaments.filament_id_by_type(tray.tray_type);
+                    http_error = "HTTP error: " + std::to_string(status);
                 }
-            } else {
-                tray.tray_info_idx = map_filament_type_to_generic_id(tray.tray_type);
-            }
+            })
+            .on_error([&](std::string body, std::string err, unsigned status) {
+                http_error = err;
+                if (status > 0) {
+                    http_error += " (HTTP " + std::to_string(status) + ")";
+                }
+            })
+            .perform_sync();
 
-            // Extract NFC temperature data if available
-            if (nfc_info.is_array() && i < static_cast<int>(nfc_info.size()) && nfc_info[i].is_object()) {
-                auto& nfc_slot = nfc_info[i];
-                std::string vendor = nfc_slot.value("VENDOR", "NONE");
-                if (vendor != "NONE" && !vendor.empty()) {
-                    tray.bed_temp    = nfc_slot.value("BED_TEMP", 0);
-                    tray.nozzle_temp = nfc_slot.value("FIRST_LAYER_TEMP", 0);
-                }
-            }
+        if (!success) {
+            BOOST_LOG_TRIVIAL(warning) << "SnapmakerPrinterAgent::fetch_filament_info: HTTP request failed: " << http_error;
+            return;
         }
 
-        trays.emplace_back(std::move(tray));
-    }
+        auto json = nlohmann::json::parse(response_body, nullptr, false, true);
+        if (json.is_discarded()) {
+            BOOST_LOG_TRIVIAL(warning) << "SnapmakerPrinterAgent::fetch_filament_info: Invalid JSON response";
+            return;
+        }
 
-    build_ams_payload(1, slot_count - 1, trays);
+        // Navigate to result.status.print_task_config
+        if (!json.contains("result") || !json["result"].contains("status") || !json["result"]["status"].contains("print_task_config")) {
+            BOOST_LOG_TRIVIAL(warning) << "SnapmakerPrinterAgent::fetch_filament_info: Missing print_task_config in response";
+            return;
+        }
+
+        auto& ptc = json["result"]["status"]["print_task_config"];
+
+        // Read parallel arrays from print_task_config
+        auto filament_exist    = ptc.value("filament_exist", std::vector<bool>{});
+        auto filament_type     = ptc.value("filament_type", std::vector<std::string>{});
+        auto filament_sub_type = ptc.value("filament_sub_type", std::vector<std::string>{});
+        auto filament_color    = ptc.value("filament_color_rgba", std::vector<std::string>{});
+        auto filament_vendor   = ptc.value("filament_vendor", std::vector<std::string>{});
+
+        const int slot_count = static_cast<int>(filament_exist.size());
+        if (slot_count == 0) {
+            BOOST_LOG_TRIVIAL(info) << "SnapmakerPrinterAgent::fetch_filament_info: No filament slots reported";
+            return;
+        }
+
+        // Read NFC filament_detect data for temperature info (optional)
+        nlohmann::json nfc_info;
+        if (json["result"]["status"].contains("filament_detect") && json["result"]["status"]["filament_detect"].contains("info")) {
+            nfc_info = json["result"]["status"]["filament_detect"]["info"];
+        }
+
+        static const std::string empty_str;
+        static const std::string default_color = "FFFFFFFF";
+
+        std::vector<AmsTrayData> trays;
+        trays.reserve(slot_count);
+
+        for (int i = 0; i < slot_count; ++i) {
+            AmsTrayData tray;
+            tray.slot_index   = i;
+            tray.has_filament = filament_exist[i];
+
+            if (tray.has_filament) {
+                tray.tray_type  = combine_filament_type(safe_at(filament_type, i, empty_str), safe_at(filament_sub_type, i, empty_str));
+                tray.tray_color = safe_at(filament_color, i, default_color);
+
+                auto* bundle = GUI::wxGetApp().preset_bundle;
+                // Try to find a matching preset for this filament based on vendor, type and color.
+                // If not found, default to traditional search by type only or generic type mapping.
+                if (bundle) {
+                    std::string vendor      = safe_at(filament_vendor, i, empty_str);
+                    std::string filament_id = find_closest_color_preset_by_vendor_and_type(bundle->filaments, vendor, tray.tray_type,
+                                                                                           tray.tray_color);
+
+                    if (!filament_id.empty()) {
+                        tray.tray_info_idx = filament_id;
+                        BOOST_LOG_TRIVIAL(warning)
+                            << "Filament sync: Found manufacturer-specific profile for slot " << i << ": " << filament_id;
+                    } else {
+                        tray.tray_info_idx = bundle->filaments.filament_id_by_type(tray.tray_type);
+                    }
+                } else {
+                    tray.tray_info_idx = map_filament_type_to_generic_id(tray.tray_type);
+                }
+
+                // Extract NFC temperature data if available
+                if (nfc_info.is_array() && i < static_cast<int>(nfc_info.size()) && nfc_info[i].is_object()) {
+                    auto& nfc_slot     = nfc_info[i];
+                    std::string vendor = nfc_slot.value("VENDOR", "NONE");
+                    if (vendor != "NONE" && !vendor.empty()) {
+                        tray.bed_temp    = nfc_slot.value("BED_TEMP", 0);
+                        tray.nozzle_temp = nfc_slot.value("FIRST_LAYER_TEMP", 0);
+                    }
+                }
+            }
+
+            trays.emplace_back(std::move(tray));
+        }
+
+        build_ams_payload(1, slot_count - 1, trays);
+    }).detach();
+
     return true;
 }
 

@@ -73,10 +73,9 @@ public:
     int set_on_local_connect_fn(OnLocalConnectedFn fn) override;
     int set_on_local_message_fn(OnMessageFn fn) override;
     int set_queue_on_main_fn(QueueOnMainFn fn) override;
-
-    // Pull-mode agent (on-demand filament sync)
-    FilamentSyncMode get_filament_sync_mode() const override { return FilamentSyncMode::pull; }
     bool fetch_filament_info(std::string dev_id, FilamentSyncMode sync_mode = FilamentSyncMode::pull) override;
+    CameraStreamMode get_camera_stream_mode() const override;
+    std::string get_camera_url() const override;
 
 protected:
     struct MoonrakerDeviceInfo
@@ -153,7 +152,6 @@ private:
 
     bool fetch_object_list(const std::string& base_url, const std::string& api_key, std::set<std::string>& objects, std::string& error) const;
     bool query_printer_status(const std::string& base_url, const std::string& api_key, nlohmann::json& status, std::string& error) const;
-    bool fetch_webcam_info(const std::string& base_url, const std::string& api_key, uint64_t generation);
 
     void announce_printhost_device();
     void dispatch_local_connect(int state, const std::string& dev_id, const std::string& msg);
@@ -188,6 +186,12 @@ private:
                                    const std::string& api_key,
                                    uint64_t generation);
 
+    // why: a printer with no /server/webcams/list entry can still name its stream directly;
+    // subclasses (e.g. printers with a fixed webcam path) can override this instead.
+    virtual std::string webcam_stream_override(const std::string& base_url) const { return {}; }
+    void refresh_webcam_info() const;
+    bool fetch_webcam_info(const std::string& base_url, const std::string& api_key, uint64_t generation) const;
+
     // System-specific filament fetch methods
     bool fetch_hh_filament_info(std::vector<AmsTrayData>& trays, int& max_lane_index);
     bool fetch_moonraker_filament_data(std::vector<AmsTrayData>& trays, int& max_lane_index);
@@ -219,8 +223,13 @@ private:
     // note: guarded by payload_mutex; filled by refresh_thumbnail_url(), empty url = looked up, none found
     std::string        thumbnail_filename;
     std::string        thumbnail_url;
-    std::string        webcam_stream_url;
+    mutable std::string        webcam_stream_url;
+    mutable CameraStreamMode   webcam_stream_mode = CameraStreamMode::none;
+    mutable uint64_t            webcam_info_last_lookup_ms = 0;
+    mutable uint64_t            webcam_info_generation = 0;
     unsigned            thumbnail_lookup_attempts = 0;
+
+    static constexpr uint64_t WEBCAM_INFO_REFRESH_INTERVAL_MS = 1000;
 
     std::atomic<int>       next_jsonrpc_id{1};
     std::set<std::string>  available_objects;  // Track for feature detection

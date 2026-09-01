@@ -1026,6 +1026,20 @@ bool NetworkAgent::fetch_filament_info(std::string dev_id, FilamentSyncMode sync
     return false;
 }
 
+CameraStreamMode NetworkAgent::get_camera_stream_mode() const
+{
+    if (m_printer_agent)
+        return m_printer_agent->get_camera_stream_mode();
+    return CameraStreamMode::none;
+}
+
+std::string NetworkAgent::get_local_camera_stream_url() const
+{
+    if (m_printer_agent)
+        return m_printer_agent->get_camera_url();
+    return {};
+}
+
 int NetworkAgent::request_bind_ticket(std::string* ticket)
 {
     if (m_printer_agent)
