@@ -41,6 +41,8 @@ public:
     int start_local_print(PrintParams params, OnUpdateStatusFn update_fn, WasCancelledFn cancel_fn) override                            = 0;
     FilamentSyncMode get_filament_sync_mode() const override                                                                            = 0;
     bool fetch_filament_info(std::string dev_id, FilamentSyncMode sync_mode = FilamentSyncMode::pull) override                          = 0;
+    CameraStreamMode get_camera_stream_mode() const override                                                                            = 0;
+    std::string get_camera_url() const override                                                                                         = 0;
 
     int check_cert() override                                            = 0;
     void install_device_cert(std::string dev_id, bool lan_only) override = 0;

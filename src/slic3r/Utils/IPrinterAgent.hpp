@@ -81,6 +81,14 @@ enum class FilamentSyncMode {
     pull          ///< On-demand fetch via REST API (blocking call)
 };
 
+enum class CameraStreamMode {
+    none = 0,
+    http,  // LAN or Cloud
+    rtsp,  // LAN only
+    webrtc, // Cloud only
+    http_snapshot // HTTP endpoint returning one image per request
+};
+
 /**
  * IPrinterAgent - Interface for printer operations.
  *
@@ -355,11 +363,25 @@ public:
     virtual FilamentSyncMode get_filament_sync_mode() const { return FilamentSyncMode::none; }
 
     /**
+     * Get the camera stream mode for this agent. This value can be deterministic and derived at
+     * runtime if the printer supports multiple camera stream modes. E.g. LAN => HTTP/RTSP, Cloud => WebRTC.
+     *
+     * @return CameraStreamMode indicating how the camera stream is obtained or used:
+     */
+    virtual CameraStreamMode get_camera_stream_mode() const { return CameraStreamMode::none; }
+
+    /**
      * Refresh filament info from the printer synchronously.
      * Should only be called when get_filament_sync_mode() returns FilamentSyncMode::pull.
      * Populates the MachineObject's DevFilaSystem with fetched filament data.
      */
     virtual bool fetch_filament_info(std::string dev_id, FilamentSyncMode sync_mode = FilamentSyncMode::pull) { return false; }
+
+    /**
+     * Get the current camera stream URL for this agent's active machine.
+     * Only meaningful when get_camera_stream_mode() returns an HTTP or RTSP mode.
+     */
+    virtual std::string get_camera_url() const { return {}; }
 };
 
 } // namespace Slic3r
