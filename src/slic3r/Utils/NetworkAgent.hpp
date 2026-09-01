@@ -5,6 +5,7 @@
 
 #include "libslic3r/ProjectTask.hpp"
 #include "ICloudServiceAgent.hpp"
+#include "IPrinterAgent.hpp"
 
 #include <map>
 #include <memory>
@@ -14,7 +15,6 @@
 namespace Slic3r {
 
 class IPrinterAgent;
-enum class FilamentSyncMode;
 
 // Forward declaration
 class BBLNetworkPlugin;
