@@ -2063,7 +2063,6 @@ void InputIpAddressDialog::on_text(wxCommandEvent &evt)
 
     if (str_access_code.IsEmpty()) {
         str_access_code = "88888888";
-        m_input_access_code->GetTextCtrl()->SetValue(str_access_code);
     }
 
     auto str_name            = m_input_printer_name->GetTextCtrl()->GetValue().Strip(wxString::both);

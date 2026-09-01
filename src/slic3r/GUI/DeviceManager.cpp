@@ -1338,7 +1338,6 @@ int MachineObject::command_get_access_code() {
     return this->publish_json(j);
 }
 
-
 int MachineObject::command_request_push_all(bool request_now)
 {
     auto curr_time = std::chrono::system_clock::now();

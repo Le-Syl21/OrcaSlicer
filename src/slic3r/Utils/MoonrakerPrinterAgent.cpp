@@ -750,6 +750,57 @@ bool MoonrakerPrinterAgent::fetch_filament_info(std::string dev_id, FilamentSync
     return false;
 }
 
+CameraStreamMode MoonrakerPrinterAgent::get_camera_stream_mode() const
+{
+    refresh_webcam_info();
+    std::lock_guard<std::recursive_mutex> lock(payload_mutex);
+    return webcam_stream_mode;
+}
+
+std::string MoonrakerPrinterAgent::get_camera_url() const
+{
+    refresh_webcam_info();
+    std::lock_guard<std::recursive_mutex> lock(payload_mutex);
+    return webcam_stream_url;
+}
+
+void MoonrakerPrinterAgent::refresh_webcam_info() const
+{
+    std::string base_url;
+    std::string api_key;
+    uint64_t    generation;
+    {
+        std::lock_guard<std::recursive_mutex> lock(connect_mutex);
+        base_url  = device_info.base_url;
+        api_key   = device_info.api_key;
+        generation = connect_generation.load();
+    }
+
+    const uint64_t now_ms = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+
+    if (base_url.empty()) {
+        std::lock_guard<std::recursive_mutex> lock(payload_mutex);
+        webcam_stream_url.clear();
+        webcam_stream_mode = CameraStreamMode::none;
+        webcam_info_last_lookup_ms = 0;
+        webcam_info_generation = generation;
+        return;
+    }
+
+    {
+        std::lock_guard<std::recursive_mutex> lock(payload_mutex);
+        if (webcam_info_generation == generation &&
+            now_ms - webcam_info_last_lookup_ms < WEBCAM_INFO_REFRESH_INTERVAL_MS) {
+            return;
+        }
+        webcam_info_generation = generation;
+        webcam_info_last_lookup_ms = now_ms;
+    }
+
+    fetch_webcam_info(base_url, api_key, generation);
+}
+
 std::string MoonrakerPrinterAgent::trim_and_upper(const std::string& input)
 {
     std::string result = input;
@@ -1605,10 +1656,11 @@ bool MoonrakerPrinterAgent::send_ws_rpc(const std::string& method, const nlohman
     return false;
 }
 
-bool MoonrakerPrinterAgent::fetch_webcam_info(const std::string& base_url, const std::string& api_key, uint64_t generation)
+bool MoonrakerPrinterAgent::fetch_webcam_info(const std::string& base_url, const std::string& api_key, uint64_t generation) const
 {
-    std::string stream_url;
+    std::string camera_url;
     std::string webcam_name;
+    CameraStreamMode stream_mode = CameraStreamMode::none;
     std::string error;
     try {
         std::string response_body;
@@ -1649,16 +1701,24 @@ bool MoonrakerPrinterAgent::fetch_webcam_info(const std::string& base_url, const
                     error = "Unexpected JSON structure";
                 } else {
                     for (const auto& webcam : result["webcams"]) {
-                        if (webcam.is_object() && webcam.value("enabled", false) && webcam.contains("stream_url") &&
-                            webcam["stream_url"].is_string()) {
-                            stream_url = webcam["stream_url"].get<std::string>();
+                        if (webcam.is_object() && webcam.value("enabled", false)) {
+                            if (webcam.contains("stream_url") && webcam["stream_url"].is_string() &&
+                                !webcam["stream_url"].get<std::string>().empty()) {
+                                camera_url = webcam["stream_url"].get<std::string>();
+                                stream_mode = CameraStreamMode::http;
+                            } else if (webcam.contains("snapshot_url") && webcam["snapshot_url"].is_string() &&
+                                       !webcam["snapshot_url"].get<std::string>().empty()) {
+                                camera_url = webcam["snapshot_url"].get<std::string>();
+                                stream_mode = CameraStreamMode::http_snapshot;
+                            }
                             if (webcam.contains("name") && webcam["name"].is_string()) {
                                 webcam_name = webcam["name"].get<std::string>();
                             }
-                            break;
+                            if (!camera_url.empty())
+                                break;
                         }
                     }
-                    if (stream_url.empty()) {
+                    if (camera_url.empty()) {
                         error = "No enabled webcam";
                     }
                 }
@@ -1666,8 +1726,8 @@ bool MoonrakerPrinterAgent::fetch_webcam_info(const std::string& base_url, const
         }
 
         if (error.empty()) {
-            if (stream_url.rfind("http", 0) != 0 && !stream_url.empty() && stream_url.front() == '/') {
-                // why: Moonraker's API port serves a JSON 404 for /webcam; relative streams use the printer web root.
+            if (camera_url.rfind("http", 0) != 0 && !camera_url.empty() && camera_url.front() == '/') {
+                // why: Moonraker's API port serves a JSON 404 for /webcam; relative camera URLs use the printer web root.
                 const size_t scheme_end = base_url.find("://");
                 const size_t authority_start = scheme_end == std::string::npos ? 0 : scheme_end + 3;
                 const size_t authority_end = base_url.find('/', authority_start);
@@ -1678,9 +1738,9 @@ bool MoonrakerPrinterAgent::fetch_webcam_info(const std::string& base_url, const
                     std::all_of(authority.begin() + port_start + 1, authority.end(), [](char c) { return c >= '0' && c <= '9'; })) {
                     authority.erase(port_start);
                 }
-                stream_url = scheme + authority + stream_url;
-            } else if (stream_url.rfind("http", 0) != 0) {
-                error = "Unsupported webcam stream URL";
+                camera_url = scheme + authority + camera_url;
+            } else if (camera_url.rfind("http", 0) != 0) {
+                error = "Unsupported webcam URL";
             }
         }
     } catch (const std::exception& e) {
@@ -1692,14 +1752,15 @@ bool MoonrakerPrinterAgent::fetch_webcam_info(const std::string& base_url, const
     {
         std::lock_guard<std::recursive_mutex> lock(payload_mutex);
         if (generation == connect_generation.load()) {
-            webcam_stream_url = error.empty() ? stream_url : "";
+            webcam_stream_url = error.empty() ? camera_url : "";
+            webcam_stream_mode = error.empty() ? stream_mode : CameraStreamMode::none;
         }
     }
     if (!error.empty()) {
         BOOST_LOG_TRIVIAL(warning) << "MoonrakerPrinterAgent: webcam discovery failed: " << error;
         return false;
     }
-    BOOST_LOG_TRIVIAL(info) << "MoonrakerPrinterAgent: selected webcam '" << webcam_name << "' with stream URL " << stream_url;
+    BOOST_LOG_TRIVIAL(info) << "MoonrakerPrinterAgent: selected webcam '" << webcam_name << "' with camera URL " << camera_url;
     return true;
 }
 
@@ -2879,8 +2940,6 @@ void MoonrakerPrinterAgent::perform_connection_async(const std::string& dev_id, 
         } else {
             BOOST_LOG_TRIVIAL(warning) << "MoonrakerPrinterAgent: Initial status query failed: " << error_msg;
         }
-
-        fetch_webcam_info(base_url, api_key, generation);
 
         // Start WebSocket status stream
         start_status_stream(dev_id, base_url, api_key);

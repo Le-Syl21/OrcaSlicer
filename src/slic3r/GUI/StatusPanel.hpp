@@ -15,7 +15,9 @@
 #include <wx/gbsizer.h>
 #include <wx/webrequest.h>
 #include <chrono>
+#include <memory>
 #include "MediaPlayCtrl.h"
+#include "WebMediaController.hpp"
 #include "AMSSetting.hpp"
 #include "Calibration.hpp"
 #include "CalibrationWizardPage.hpp"
@@ -440,7 +442,7 @@ protected:
     wxStaticBitmap *m_bitmap_sdcard_img;
     wxStaticBitmap *m_bitmap_static_use_time;
     wxStaticBitmap *m_bitmap_static_use_weight;
-    wxStaticBitmap* m_camera_switch_button;
+    // wxStaticBitmap* m_camera_switch_button;
 
 
     wxMediaCtrl3 *  m_media_ctrl;
@@ -462,6 +464,8 @@ protected:
     ScalableButton *m_button_abort;
     Button *        m_button_clean;
     wxWebView *     m_custom_camera_view{nullptr};
+    std::unique_ptr<WebMediaController> m_web_media_controller;
+
     wxSimplebook*   m_extruder_book;
     std::vector<ExtruderImage *> m_extruderImage;
 
@@ -577,13 +581,8 @@ protected:
     virtual void on_axis_ctrl_e_up_10(wxCommandEvent &event) { event.Skip(); }
     virtual void on_axis_ctrl_e_down_10(wxCommandEvent &event) { event.Skip(); }
     virtual void on_nozzle_selected(wxCommandEvent &event) { event.Skip(); }
-    void on_camera_source_change(wxCommandEvent& event);
-    void handle_camera_source_change();
     void remove_controls();
     void on_webview_navigating(wxWebViewEvent& evt);
-    void on_camera_switch_toggled(wxMouseEvent& event);
-    void toggle_custom_camera();
-    void toggle_builtin_camera();
 
 public:
     StatusBasePanel(wxWindow *      parent,
@@ -664,7 +663,6 @@ protected:
     int          m_last_timelapse = -1;
     int          m_last_extrusion = -1;
     int          m_last_vcamera   = -1;
-    std::string  m_printer_webcam_url;
     int          m_model_mall_request_count = 0;
     bool         m_is_load_with_temp = false;
     json         m_rating_result;

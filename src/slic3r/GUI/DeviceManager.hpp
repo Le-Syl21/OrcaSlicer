@@ -749,6 +749,7 @@ public:
     int command_set_printer_nozzle(std::string nozzle_type, float diameter);
     int command_set_printer_nozzle2(int id, std::string nozzle_type, float diameter);
     int command_get_access_code();
+    int command_start_camera();
     int command_ack_proceed(json& proceed);
     int command_purification_disable();
     int command_dont_remind_next_time(json& mqtt_guard_json);
@@ -797,7 +798,6 @@ public:
     int command_ams_select_tray(std::string tray_id);
     int command_ams_refresh_rfid(std::string tray_id);
     int command_ams_refresh_rfid2(int ams_id, int slot_id);
-    int command_start_camera();
     int command_ams_control(std::string action);
     int command_ams_drying_stop();
     int command_start_extrusion_cali(int tray_index, int nozzle_temp, int bed_temp, float max_volumetric_speed, std::string setting_id = "");
