@@ -1,17 +1,12 @@
 #include "WebRtcMediaController.hpp"
 
-#include "AVVideoDecoder.hpp"
-
 #include <rtc/common.hpp>
 #include <rtc/rtc.hpp>
 
 #include <mutex>
-#include <variant>
 #include <wx/mstream.h>
 
 #include <boost/log/trivial.hpp>
-
-#include <cstring>
 
 namespace {
 void init_rtc_logger_once()
@@ -24,10 +19,6 @@ void init_rtc_logger_once()
     });
 }
 } // namespace
-
-extern "C" {
-#include <libavcodec/avcodec.h>
-}
 
 namespace Slic3r { namespace GUI {
 
@@ -75,8 +66,7 @@ void WebRtcMediaController::StartSession(std::unique_ptr<ICameraSignalingChannel
     {
         std::lock_guard<std::mutex> lock(m_mutex);
         m_signaling = std::move(channel);
-        m_chunk_queue.clear();
-        m_nal_queue.clear();
+        m_jpeg_queue.clear();
         m_pending_candidates.clear();
         m_remote_description_set = false;
         m_video_size = wxDefaultSize;
@@ -130,7 +120,6 @@ void WebRtcMediaController::teardown(bool notify)
         signaling = std::move(m_signaling);
         peer_connection = std::move(m_peer_connection);
         m_data_channel.reset();
-        m_video_track.reset();
     }
     if (signaling)
         signaling->close();
@@ -140,8 +129,7 @@ void WebRtcMediaController::teardown(bool notify)
         m_decode_thread.join();
     {
         std::lock_guard<std::mutex> lock(m_mutex);
-        m_chunk_queue.clear();
-        m_nal_queue.clear();
+        m_jpeg_queue.clear();
     }
     if (was_alive && notify)
         report({Status::Stopped});
@@ -170,7 +158,7 @@ void WebRtcMediaController::bind_data_channel(const std::shared_ptr<rtc::DataCha
     dc->onMessage(
         [this](rtc::binary data) {
             if (m_alive.load())
-                enqueue_chunk(std::vector<std::byte>(data.begin(), data.end()));
+                enqueue_jpeg(std::vector<std::byte>(data.begin(), data.end()));
         },
         [](rtc::string) {});
 }
@@ -179,6 +167,10 @@ void WebRtcMediaController::on_ready(std::vector<CameraIceServer> servers)
 {
     init_rtc_logger_once();
     rtc::Configuration configuration;
+    // Allow complete-JPEG DataChannel messages up to 1 MiB. This value is
+    // advertised in SDP and becomes the upper bound for frames OrcaSonar can
+    // send to OrcaSlicer.
+    configuration.maxMessageSize = 1024 * 1024;
     for (const CameraIceServer& server : servers) {
         try {
             rtc::IceServer ice_server(server.urls);
@@ -234,16 +226,16 @@ void WebRtcMediaController::on_ready(std::vector<CameraIceServer> servers)
 
     rtc::DataChannelInit init;
     init.reliability.unordered = true;
-    init.reliability.maxPacketLifeTime = std::chrono::milliseconds(350);
+    // init.reliability.maxPacketLifeTime = std::chrono::milliseconds(350);
+    // Request one complete JPEG frame per DataChannel message. OrcaSonar
+    // keeps the legacy chunked protocol for clients that omit this property.
+    init.protocol = "orca-jpeg";
     auto data_channel = peer_connection->createDataChannel("camera", init);
     if (data_channel)
         bind_data_channel(data_channel);
 
-    // NOTE: the H.264 RTP RecvOnly track is intentionally NOT added to the offer
-    // yet. OrcaSonar answers application-only (no m=video), which makes
-    // libdatachannel renegotiate and send a second offer that OrcaSonar rejects
-    // with "webrtc.unavailable: error". Re-add the video m-line (enqueue_nal /
-    // the decode_loop NAL branch are already in place) once OrcaSonar answers it.
+    // Camera media is carried as one complete JPEG per DataChannel message;
+    // no RTP video track or application-level framing is required.
 
     std::shared_ptr<rtc::PeerConnection> peer_for_description;
     {
@@ -327,21 +319,12 @@ void WebRtcMediaController::on_unavailable(CameraUnavailableReason reason, std::
     report({Status::Failed, code});
 }
 
-void WebRtcMediaController::enqueue_chunk(std::vector<std::byte> chunk)
+void WebRtcMediaController::enqueue_jpeg(std::vector<std::byte> jpeg)
 {
     std::lock_guard<std::mutex> lock(m_mutex);
-    if (m_chunk_queue.size() >= 8)
-        m_chunk_queue.pop_front();
-    m_chunk_queue.emplace_back(std::move(chunk));
-    m_cond.notify_one();
-}
-
-void WebRtcMediaController::enqueue_nal(std::vector<std::byte> nal)
-{
-    std::lock_guard<std::mutex> lock(m_mutex);
-    if (m_nal_queue.size() >= 4)
-        m_nal_queue.pop_front();
-    m_nal_queue.emplace_back(std::move(nal));
+    if (m_jpeg_queue.size() >= 4)
+        m_jpeg_queue.pop_front();
+    m_jpeg_queue.emplace_back(std::move(jpeg));
     m_cond.notify_one();
 }
 
@@ -376,19 +359,11 @@ void WebRtcMediaController::deliver_jpeg(std::vector<std::byte> jpeg)
 
 void WebRtcMediaController::decode_loop()
 {
-    WebRtcFrameAssembler assembler;
-    assembler.on_frame = [this](std::vector<std::byte> jpeg) { deliver_jpeg(std::move(jpeg)); };
-    AVCodecParameters parameters{};
-    parameters.codec_type = AVMEDIA_TYPE_VIDEO;
-    parameters.codec_id = AV_CODEC_ID_H264;
-    AVVideoDecoder decoder;
-    bool decoder_open = false;
-
     int stall_polls = 0;
     std::unique_lock<std::mutex> lock(m_mutex);
     while (m_alive.load()) {
         const bool woke = m_cond.wait_for(lock, std::chrono::seconds(2), [this] {
-            return !m_alive.load() || !m_chunk_queue.empty() || !m_nal_queue.empty();
+            return !m_alive.load() || !m_jpeg_queue.empty();
         });
         if (!m_alive.load())
             break;
@@ -410,37 +385,11 @@ void WebRtcMediaController::decode_loop()
             continue;
         }
         stall_polls = 0;
-        if (!m_chunk_queue.empty()) {
-            auto chunk = std::move(m_chunk_queue.front());
-            m_chunk_queue.pop_front();
+        if (!m_jpeg_queue.empty()) {
+            auto jpeg = std::move(m_jpeg_queue.front());
+            m_jpeg_queue.pop_front();
             lock.unlock();
-            assembler.feed(chunk.data(), chunk.size());
-            lock.lock();
-        } else if (!m_nal_queue.empty()) {
-            auto nal = std::move(m_nal_queue.front());
-            m_nal_queue.pop_front();
-            lock.unlock();
-            if (!decoder_open)
-                decoder_open = decoder.open(parameters) == 0;
-            if (decoder_open) {
-                AVPacket* packet = av_packet_alloc();
-                if (packet && av_new_packet(packet, static_cast<int>(nal.size())) == 0) {
-                    std::memcpy(packet->data, nal.data(), nal.size());
-                    if (decoder.decode(*packet) == 0) {
-                        wxImage image;
-                        if (decoder.toWxImage(image, wxDefaultSize)) {
-                            {
-                                std::lock_guard<std::mutex> frame_lock(m_mutex);
-                                m_video_size = image.GetSize();
-                            }
-                            if (m_frame_sink)
-                                m_frame_sink(image, image.GetSize());
-                            report({Status::Playing});
-                        }
-                    }
-                }
-                av_packet_free(&packet);
-            }
+            deliver_jpeg(std::move(jpeg));
             lock.lock();
         }
     }

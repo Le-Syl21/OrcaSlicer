@@ -344,8 +344,6 @@ set(SLIC3R_GUI_SOURCES
     GUI/MediaFilePanel.h
     GUI/MediaPlayCtrl.cpp
     GUI/MediaPlayCtrl.h
-    GUI/WebRtcFrameAssembler.cpp
-    GUI/WebRtcFrameAssembler.hpp
     GUI/WebRtcMediaController.cpp
     GUI/WebRtcMediaController.hpp
     GUI/MeshUtils.cpp

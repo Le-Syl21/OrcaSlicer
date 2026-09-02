@@ -1,12 +1,12 @@
 #pragma once
 
 #include "IMediaController.hpp"
-#include "WebRtcFrameAssembler.hpp"
 
 #include <wx/image.h>
 
 #include <atomic>
 #include <chrono>
+#include <cstddef>
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
@@ -19,7 +19,6 @@
 namespace rtc {
 class DataChannel;
 class PeerConnection;
-class Track;
 }
 
 namespace Slic3r { namespace GUI {
@@ -66,14 +65,12 @@ private:
     void on_ice(std::string candidate, std::string mid);
     void on_unavailable(CameraUnavailableReason reason, std::string detail);
     void decode_loop();
-    void enqueue_chunk(std::vector<std::byte> chunk);
-    void enqueue_nal(std::vector<std::byte> nal);
+    void enqueue_jpeg(std::vector<std::byte> jpeg);
     void deliver_jpeg(std::vector<std::byte> jpeg);
 
     mutable std::mutex m_mutex;
     std::condition_variable m_cond;
-    std::deque<std::vector<std::byte>> m_chunk_queue;
-    std::deque<std::vector<std::byte>> m_nal_queue;
+    std::deque<std::vector<std::byte>> m_jpeg_queue;
     // Remote candidates can arrive before the answer; libdatachannel rejects
     // addRemoteCandidate until a remote description is set, so buffer them.
     std::vector<std::pair<std::string, std::string>> m_pending_candidates;
@@ -81,7 +78,6 @@ private:
     std::unique_ptr<ICameraSignalingChannel> m_signaling;
     std::shared_ptr<rtc::PeerConnection> m_peer_connection;
     std::shared_ptr<rtc::DataChannel> m_data_channel;
-    std::shared_ptr<rtc::Track> m_video_track;
     std::thread m_decode_thread;
     std::atomic<bool> m_alive{false};
     std::atomic<std::uint64_t> m_epoch{0};
