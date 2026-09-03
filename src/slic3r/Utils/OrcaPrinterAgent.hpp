@@ -3,9 +3,15 @@
 
 #include "IPrinterAgent.hpp"
 #include "ICloudServiceAgent.hpp"
+#include "OrcaCloudServiceAgent.hpp"
+#include "OrcaMqttConnection.hpp"
+#include <atomic>
+#include <cstdint>
+#include <functional>
 #include <string>
 #include <mutex>
 #include <memory>
+#include <thread>
 
 namespace Slic3r {
 
@@ -79,16 +85,95 @@ public:
     int set_on_local_message_fn(OnMessageFn fn) override;
     int set_queue_on_main_fn(QueueOnMainFn fn) override;
 
+    // Test-only: drive emit_connect_sequence directly (no socket).
+    void run_connect_sequence_for_test(const std::string& dev_id) {
+        emit_connect_sequence(dev_id, [](const std::string&){}, [](const std::string&){});
+    }
+
+    // Test-only: advance the LAN connection epoch without a connect/disconnect cycle.
+    void bump_lan_generation_for_test() { ++m_lan_generation; }
+    // Test-only: the same for the (independent) cloud selection epoch.
+    void bump_cloud_generation_for_test() { ++m_cloud_generation; }
+
+protected:
+    // Forward one inbound printer message to on_message_fn (marshalled onto the UI
+    // thread via queue_on_main_fn when set). Body of every connection's MessageHandler.
+    void deliver_to_sink(const std::string& dev_id, const std::string& payload);
+
+    // LAN has a separate callback in the existing IPrinterAgent contract because the
+    // GUI parses local reports with the "lan" dialect and looks up local machines.
+    void deliver_to_local_sink(const std::string& dev_id, const std::string& payload);
+
+    // Report the asynchronous LAN connection state using the same callback contract as
+    // the other printer agents. The transport result cannot be returned by
+    // connect_printer(), which only starts the worker.
+    void dispatch_local_connect(int state, const std::string& dev_id, const std::string& message);
+
+    // The LAN inbound-message handler for one connection generation: forwards to
+    // deliver_to_sink only while `generation` is still the live epoch.
+    std::function<void(const std::string&, const std::string&)> make_lan_message_handler(uint64_t generation);
+
+    // Pure LAN-address parsing + client-id. protected static so the test Probe reaches them.
+    static bool        parse_lan_endpoint(const std::string& dev_ip, std::string& host, std::string& port);
+    static std::string make_lan_client_id(const std::string& dev_id);
+    // Test hook: the ws:// URL connect_printer built for the current LAN session ("" if none).
+    std::string        lan_connection_target() const;
+    // Shared post-connect sequence: SUBSCRIBE, then pushing.start, pushall,
+    // info.get_version, info.get_capabilities. Runs identically on LAN and cloud.
+    void on_connected(const std::string& dev_id, OrcaMqttConnection* conn, uint64_t generation);
+
+    // The post-connect command sequence, factored behind a seam so a test can
+    // observe the SUBSCRIBE + 4 request payloads without a live OrcaMqttConnection.
+    virtual void emit_connect_sequence(const std::string& dev_id,
+                                       std::function<void(const std::string&)> subscribe,
+                                       std::function<void(const std::string&)> request);
+    static std::string seq(int n);   // decimal string in the OrcaSlicer 20000..29999 band
+    static std::string build_pushing_start(const std::string& sequence_id);
+    static std::string build_pushing_stop(const std::string& sequence_id);
+    static std::string build_pushall(const std::string& sequence_id);
+    static std::string build_get_version(const std::string& sequence_id);
+    static std::string build_get_capabilities(const std::string& sequence_id);
+
 private:
+    class OrcaSonarDiscovery;
+
     std::string log_dir;
     std::string selected_machine;
-    std::shared_ptr<ICloudServiceAgent> m_cloud_agent;
-    OrcaCloudServiceAgent* m_orca_cloud = nullptr;   // == m_cloud_agent.get() when the Orca provider is active
 
-    // MOCK: OrcaCloud does not yet relay the printer's info.get_version reply, so
-    // synthesize it and feed it through on_message_fn (same sink as real report
-    // messages). Delete once the backend answers info.get_version.
-    void deliver_mock_get_version(const std::string& dev_id);
+    enum CurrentConn {
+        NONE,
+        CLOUD,
+        LAN
+    };
+    CurrentConn m_current_connection = NONE;
+
+    std::shared_ptr<ICloudServiceAgent> m_cloud_agent;
+    std::unique_ptr<OrcaMqttConnection> lan_mqtt_connection;
+
+    // Two independent epochs: a cloud (de)selection must not fence the live LAN
+    // feed, and vice versa. Each transport's connect thread and inbound handler
+    // compare against their own counter only.
+    std::atomic<uint64_t> m_lan_generation{0};
+    std::atomic<uint64_t> m_cloud_generation{0};
+
+    // The short-lived threads that run the blocking initial connect for the current
+    // LAN / cloud session. Joined members (never detached) so they cannot outlive
+    // *this or the connection they hold a raw pointer to.
+    std::thread m_lan_connect_thread;
+    std::thread m_cloud_connect_thread;
+
+    std::unique_ptr<OrcaSonarDiscovery> m_discovery;
+
+    std::string           m_lan_dev_id;   // guarded by state_mutex
+    std::string           m_lan_url;      // guarded by state_mutex — the Config.url of the live LAN session
+
+    OrcaCloudServiceAgent* get_orca_cloud_agent();
+
+    OrcaMqttConnection* get_appropriate_mqtt_connection(bool is_lan = true);
+
+    // Route one command payload to device/<dev_id>/request on the LAN or the cloud
+    // per-printer connection. The uniform send path for both send_message* overrides.
+    int route_send(bool is_lan, const std::string& dev_id, const std::string& json_str);
 
     // Callbacks
     OnMsgArrivedFn on_ssdp_msg_fn;

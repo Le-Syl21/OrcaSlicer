@@ -13,6 +13,8 @@ add_executable(${_TEST_NAME}_tests
     test_plugin_status.cpp
     test_printer_agent.cpp
     test_qidi_printer_agent.cpp
+    test_orca_mqtt_connection.cpp
+    test_orca_printer_agent.cpp
     test_plugin_install.cpp
     test_plugin_lifecycle.cpp
     test_slicing_pipeline_bindings.cpp
