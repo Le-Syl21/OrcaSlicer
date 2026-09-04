@@ -65,522 +65,6 @@ using json = nlohmann::json;
 
 namespace Slic3r {
 
-struct OrcaCloudMqttConnection::Connection {
-    boost::asio::io_context io_context;
-    boost::asio::ssl::context ssl_context;
-    WebSocket websocket;
-    boost::asio::ip::tcp::resolver resolver;
-
-    Connection()
-        : ssl_context(boost::asio::ssl::context::tls_client)
-        , websocket(io_context, ssl_context)
-        , resolver(io_context)
-    {}
-};
-
-OrcaCloudMqttConnection::~OrcaCloudMqttConnection() { stop(); }
-
-bool OrcaCloudMqttConnection::start(const std::string& endpoint, TokenProvider token_provider, MessageHandler message_handler, StateHandler state_handler) {
-    BOOST_LOG_TRIVIAL(info) << "Orca diagnostic: MQTT start endpoint=" << endpoint
-                            << " token_callback=" << (token_provider ? "set" : "null")
-                            << " message_callback=" << (message_handler ? "set" : "null")
-                            << " state_callback=" << (state_handler ? "set" : "null");
-    stop();
-    {
-        std::lock_guard<std::mutex> lock(mutex);
-        endpoint_url     = endpoint;
-        get_token        = std::move(token_provider);
-        on_message       = std::move(message_handler);
-        on_state         = std::move(state_handler);
-        initial_result   = false;
-        initial_completed = false;
-        connected        = false;
-    }
-    stopping.store(false);
-    worker = std::thread(&OrcaCloudMqttConnection::run, this);
-
-    std::unique_lock<std::mutex> lock(mutex);
-    if (!initial_cv.wait_for(lock, std::chrono::seconds(10), [this] { return initial_completed; })) {
-        initial_completed = true;
-        initial_result    = false;
-        BOOST_LOG_TRIVIAL(warning) << "Orca diagnostic: MQTT initial connection timed out after 10 seconds; worker will retry";
-    }
-    BOOST_LOG_TRIVIAL(info) << "Orca diagnostic: MQTT start initial_result=" << initial_result
-                            << " initial_completed=" << initial_completed;
-    return initial_result;
-}
-
-void OrcaCloudMqttConnection::stop() {
-    BOOST_LOG_TRIVIAL(info) << "Orca diagnostic: MQTT stop requested";
-    stopping.store(true);
-    state_cv.notify_all();
-    {
-        std::lock_guard<std::mutex> lock(connection_mutex);
-        if (active_connection) {
-            auto& socket = boost::beast::get_lowest_layer(active_connection->websocket).socket();
-            boost::system::error_code socket_error;
-            socket.cancel(socket_error);
-            socket.shutdown(boost::asio::ip::tcp::socket::shutdown_both, socket_error);
-            socket.close(socket_error);
-            active_connection->resolver.cancel();
-        }
-    }
-    if (worker.joinable())
-        worker.join();
-
-    {
-        std::lock_guard<std::mutex> lock(mutex);
-        connected = false;
-        if (!initial_completed) {
-            initial_completed = true;
-            initial_result    = false;
-        }
-    }
-    initial_cv.notify_all();
-}
-
-bool OrcaCloudMqttConnection::is_running() const {
-    return worker.joinable() && !stopping.load();
-}
-
-void OrcaCloudMqttConnection::flush_subscription_change() {
-    std::shared_ptr<Connection> conn;
-    {
-        std::lock_guard<std::mutex> lock(connection_mutex);
-        conn = active_connection;
-    }
-    bool connacked;
-    {
-        std::lock_guard<std::mutex> lock(mutex);
-        connacked = connected;
-    }
-    if (!conn || !connacked)
-        return; // no live MQTT session yet — the worker sends the set on CONNACK
-
-    // beast permits a concurrent writer while the worker is blocked in
-    // websocket.read(); every write is serialised by write_mutex inside send().
-    try {
-        send_pending_subscriptions(conn->websocket);
-    } catch (const std::exception& e) {
-        BOOST_LOG_TRIVIAL(warning) << "Orca diagnostic: direct subscription write failed (" << e.what()
-                                   << "); worker will resend the full set on reconnect";
-    }
-}
-
-bool OrcaCloudMqttConnection::subscribe(const std::vector<std::string>& device_ids) {
-    {
-        std::lock_guard<std::mutex> lock(mutex);
-        BOOST_LOG_TRIVIAL(info) << "Orca diagnostic: MQTT subscribe requested count=" << device_ids.size()
-                                << " connected=" << connected.load();
-        for (const std::string& device_id : device_ids) {
-            BOOST_LOG_TRIVIAL(info) << "Orca diagnostic: MQTT subscribe requested dev_id=" << device_id;
-            if (device_id.empty() || report_topic(device_id).size() > 96) {
-                BOOST_LOG_TRIVIAL(warning) << "Orca diagnostic: MQTT subscribe rejected invalid dev_id=" << device_id;
-                return false;
-            }
-        }
-        for (const std::string& device_id : device_ids) {
-            subscriptions.insert(device_id);
-            pending_subscriptions.insert(device_id);
-        }
-        BOOST_LOG_TRIVIAL(info) << "Orca diagnostic: MQTT subscribe queued total_subscriptions=" << subscriptions.size()
-                                << " pending_subscriptions=" << pending_subscriptions.size();
-    }
-    state_cv.notify_all();
-    flush_subscription_change(); // emit SUBSCRIBE now on the live socket (no reconnect)
-    return true;
-}
-
-bool OrcaCloudMqttConnection::unsubscribe(const std::vector<std::string>& device_ids) {
-    {
-        std::lock_guard<std::mutex> lock(mutex);
-        BOOST_LOG_TRIVIAL(info) << "Orca diagnostic: MQTT unsubscribe requested count=" << device_ids.size()
-                                << " connected=" << connected.load();
-        for (const std::string& device_id : device_ids) {
-            BOOST_LOG_TRIVIAL(info) << "Orca diagnostic: MQTT unsubscribe requested dev_id=" << device_id;
-            subscriptions.erase(device_id);
-            pending_subscriptions.erase(device_id);
-            pending_unsubscriptions.insert(device_id);
-        }
-        BOOST_LOG_TRIVIAL(info) << "Orca diagnostic: MQTT unsubscribe queued total_subscriptions=" << subscriptions.size()
-                                << " pending_unsubscriptions=" << pending_unsubscriptions.size();
-    }
-    state_cv.notify_all();
-    flush_subscription_change(); // emit UNSUBSCRIBE now on the live socket (no reconnect)
-    return true;
-}
-
-void OrcaCloudMqttConnection::clear_subscriptions() {
-    std::lock_guard<std::mutex> lock(mutex);
-    BOOST_LOG_TRIVIAL(info) << "Orca diagnostic: MQTT clear subscriptions count=" << subscriptions.size();
-    subscriptions.clear();
-    pending_subscriptions.clear();
-    pending_unsubscriptions.clear();
-}
-
-bool OrcaCloudMqttConnection::parse_endpoint(const std::string& url, Endpoint& endpoint) {
-    constexpr const char* scheme = "wss://";
-    constexpr size_t scheme_length = 6;
-    if (url.compare(0, scheme_length, scheme) != 0)
-        return false;
-
-    const size_t authority_start = scheme_length;
-    const size_t path_start      = url.find('/', authority_start);
-    const std::string authority  = url.substr(authority_start, path_start - authority_start);
-    if (authority.empty())
-        return false;
-
-    const size_t port_start = authority.rfind(':');
-    if (port_start != std::string::npos && authority.find(']') == std::string::npos) {
-        endpoint.host = authority.substr(0, port_start);
-        endpoint.port = authority.substr(port_start + 1);
-    } else {
-        endpoint.host = authority;
-        endpoint.port = "443";
-    }
-    endpoint.target = path_start == std::string::npos ? "/" : url.substr(path_start);
-    return !endpoint.host.empty() && !endpoint.port.empty() && !endpoint.target.empty();
-}
-
-void OrcaCloudMqttConnection::append_string(std::vector<uint8_t>& packet, const std::string& value) {
-    if (value.size() > 0xffff)
-        throw std::runtime_error("MQTT string is too long");
-    packet.push_back(static_cast<uint8_t>(value.size() >> 8));
-    packet.push_back(static_cast<uint8_t>(value.size() & 0xff));
-    packet.insert(packet.end(), value.begin(), value.end());
-}
-
-void OrcaCloudMqttConnection::prepend_remaining_length(std::vector<uint8_t>& packet, size_t length) {
-    std::vector<uint8_t> encoded;
-    do {
-        uint8_t byte = static_cast<uint8_t>(length % 128);
-        length /= 128;
-        if (length != 0)
-            byte |= 0x80;
-        encoded.push_back(byte);
-    } while (length != 0);
-    packet.insert(packet.begin() + 1, encoded.begin(), encoded.end());
-}
-
-std::vector<uint8_t> OrcaCloudMqttConnection::make_connect_packet() {
-    std::vector<uint8_t> packet{0x10};
-    append_string(packet, "MQTT");
-    packet.insert(packet.end(), {4, 2, 0, 60}); // level 4, clean session, 60 s keepalive
-    append_string(packet, "OrcaSlicer");
-    prepend_remaining_length(packet, packet.size() - 1);
-    return packet;
-}
-
-std::string OrcaCloudMqttConnection::report_topic(const std::string& device_id) { return "device/" + device_id + "/report"; }
-
-std::vector<uint8_t> OrcaCloudMqttConnection::make_topic_packet(uint8_t type, uint16_t packet_id, const std::vector<std::string>& device_ids) {
-    std::vector<uint8_t> packet{type};
-    packet.push_back(static_cast<uint8_t>(packet_id >> 8));
-    packet.push_back(static_cast<uint8_t>(packet_id & 0xff));
-    for (const std::string& device_id : device_ids) {
-        append_string(packet, report_topic(device_id));
-        if (type == 0x82) // SUBSCRIBE, QoS 0 is sufficient for printer reports.
-            packet.push_back(0);
-    }
-    prepend_remaining_length(packet, packet.size() - 1);
-    return packet;
-}
-
-std::vector<uint8_t> OrcaCloudMqttConnection::make_ping_packet() { return {0xc0, 0}; }
-
-void OrcaCloudMqttConnection::send(WebSocket& websocket, const std::vector<uint8_t>& packet) {
-    if (packet.empty()) {
-        BOOST_LOG_TRIVIAL(warning) << "Orca diagnostic: attempted to send empty MQTT packet";
-        return;
-    }
-    // Writes come from the worker thread AND, for dynamic (un)subscribes, the
-    // caller thread. Serialise them; the worker's concurrent read is fine (beast
-    // allows one reader + one writer).
-    std::lock_guard<std::mutex> lock(write_mutex);
-    BOOST_LOG_TRIVIAL(info) << "Orca diagnostic: sending MQTT packet type=0x" << std::hex
-                            << static_cast<unsigned int>(packet[0] >> 4) << std::dec
-                            << " bytes=" << packet.size();
-    websocket.binary(true);
-    websocket.write(boost::asio::buffer(packet));
-}
-
-void OrcaCloudMqttConnection::connect_and_read() {
-    auto connection = std::make_shared<Connection>();
-    {
-        std::lock_guard<std::mutex> lock(connection_mutex);
-        active_connection = connection;
-        if (stopping.load())
-            return;
-    }
-
-    Endpoint endpoint;
-    if (!parse_endpoint(endpoint_url, endpoint)) {
-        BOOST_LOG_TRIVIAL(error) << "Orca diagnostic: invalid MQTT endpoint=" << endpoint_url;
-        throw std::runtime_error("invalid Orca Cloud WebSocket endpoint");
-    }
-
-    BOOST_LOG_TRIVIAL(info) << "Orca diagnostic: MQTT connecting host=" << endpoint.host
-                            << " port=" << endpoint.port << " target=" << endpoint.target;
-
-    auto& websocket = connection->websocket;
-    const auto results = connection->resolver.resolve(endpoint.host, endpoint.port);
-    BOOST_LOG_TRIVIAL(info) << "Orca diagnostic: MQTT DNS resolution succeeded host=" << endpoint.host;
-    auto& stream = boost::beast::get_lowest_layer(websocket);
-    stream.expires_after(std::chrono::seconds(10));
-    stream.connect(results);
-    BOOST_LOG_TRIVIAL(info) << "Orca diagnostic: MQTT TCP connection established host=" << endpoint.host
-                            << " port=" << endpoint.port;
-
-    // The aggregate viewer is a TLS WebSocket endpoint. Set SNI before the
-    // TLS handshake so the cloud edge selects the correct certificate.
-    auto& tls_stream = websocket.next_layer();
-    if (!SSL_set_tlsext_host_name(tls_stream.native_handle(), endpoint.host.c_str()))
-        throw std::runtime_error("failed to set Orca Cloud TLS server name");
-    connection->ssl_context.set_default_verify_paths();
-    tls_stream.set_verify_mode(boost::asio::ssl::verify_peer);
-    tls_stream.set_verify_callback(boost::asio::ssl::host_name_verification(endpoint.host));
-    tls_stream.handshake(boost::asio::ssl::stream_base::client);
-    BOOST_LOG_TRIVIAL(info) << "Orca diagnostic: MQTT TLS handshake completed host=" << endpoint.host;
-
-    const std::string token = get_token ? get_token() : std::string();
-    if (token.empty()) {
-        BOOST_LOG_TRIVIAL(error) << "Orca diagnostic: MQTT token callback returned an empty token";
-        throw std::runtime_error("no access token for Orca Cloud WebSocket");
-    }
-
-    websocket.set_option(boost::beast::websocket::stream_base::decorator(
-        [token](boost::beast::websocket::request_type& request) {
-            request.set(boost::beast::http::field::user_agent, "OrcaSlicer");
-            request.set(boost::beast::http::field::authorization, "Bearer " + token);
-            request.set("Sec-WebSocket-Protocol", "mqtt");
-        }));
-    boost::beast::http::response<boost::beast::http::string_body> response;
-    boost::system::error_code handshake_error;
-    websocket.handshake(response, endpoint.host, endpoint.target, handshake_error);
-    if (handshake_error) {
-        // Surface the server's HTTP status so a persistent rejection (stale token,
-        // missing api key, wrong route) is diagnosable from the log rather than an
-        // opaque "handshake declined".
-        BOOST_LOG_TRIVIAL(warning) << "OrcaCloudMqttConnection: handshake rejected, http="
-                                   << response.result_int() << " (" << response.reason() << "), "
-                                   << handshake_error.message();
-        throw boost::system::system_error(handshake_error, "Orca Cloud WebSocket handshake");
-    }
-    BOOST_LOG_TRIVIAL(info) << "Orca diagnostic: WebSocket handshake completed http=" << response.result_int()
-                            << " negotiated_protocol=" << response["Sec-WebSocket-Protocol"];
-    if (response["Sec-WebSocket-Protocol"] != "mqtt") {
-        BOOST_LOG_TRIVIAL(error) << "Orca diagnostic: WebSocket handshake did not negotiate MQTT";
-        throw std::runtime_error("Orca Cloud WebSocket did not negotiate MQTT");
-    }
-
-    stream.expires_never();
-    send(websocket, make_connect_packet());
-    BOOST_LOG_TRIVIAL(info) << "Orca diagnostic: MQTT CONNECT packet sent";
-
-    boost::beast::flat_buffer buffer;
-    stream.expires_after(std::chrono::seconds(10));
-    websocket.read(buffer);
-    const std::string connack = boost::beast::buffers_to_string(buffer.data());
-    BOOST_LOG_TRIVIAL(info) << "Orca diagnostic: MQTT CONNACK received bytes=" << connack.size()
-                            << " header=" << (connack.empty() ? -1 : static_cast<int>(static_cast<uint8_t>(connack[0])))
-                            << " return_code=" << (connack.size() > 3 ? static_cast<int>(static_cast<uint8_t>(connack[3])) : -1);
-    if (connack.size() != 4 || static_cast<uint8_t>(connack[0]) != 0x20 ||
-        static_cast<uint8_t>(connack[2]) != 0x00 || static_cast<uint8_t>(connack[3]) != 0x00) {
-        BOOST_LOG_TRIVIAL(error) << "Orca diagnostic: MQTT CONNECT was refused or malformed";
-        throw std::runtime_error("Orca Cloud MQTT CONNECT was refused");
-    }
-
-    notify_state(true);
-    reconnect_delay_seconds.store(1); // a fresh CONNACK resets the backoff
-    BOOST_LOG_TRIVIAL(info) << "Orca diagnostic: MQTT connection is ready; sending current subscriptions";
-    send_current_subscriptions(websocket);
-    std::chrono::steady_clock::time_point next_ping = std::chrono::steady_clock::now() + std::chrono::seconds(30);
-
-    while (!stopping.load()) {
-        send_pending_subscriptions(websocket);
-        buffer.consume(buffer.size());
-        stream.expires_after(std::chrono::seconds(1));
-        boost::system::error_code error;
-        websocket.read(buffer, error);
-        if (error == boost::beast::error::timeout) {
-            if (std::chrono::steady_clock::now() >= next_ping) {
-                send(websocket, make_ping_packet());
-                BOOST_LOG_TRIVIAL(info) << "Orca diagnostic: MQTT PINGREQ sent";
-                next_ping = std::chrono::steady_clock::now() + std::chrono::seconds(30);
-            }
-            continue;
-        }
-        if (error) {
-            BOOST_LOG_TRIVIAL(warning) << "Orca diagnostic: MQTT WebSocket read failed code=" << error.value()
-                                       << " message=" << error.message();
-            throw boost::system::system_error(error, "read Orca Cloud MQTT message");
-        }
-        handle_packet(boost::beast::buffers_to_string(buffer.data()));
-    }
-
-    boost::system::error_code close_error;
-    websocket.close(boost::beast::websocket::close_code::normal, close_error);
-    BOOST_LOG_TRIVIAL(info) << "Orca diagnostic: MQTT connection closed code=" << close_error.value()
-                            << " message=" << close_error.message();
-    if (!stopping.load())
-        notify_state(false);
-}
-
-void OrcaCloudMqttConnection::send_current_subscriptions(WebSocket& websocket) {
-    std::vector<std::string> devices;
-    {
-        std::lock_guard<std::mutex> lock(mutex);
-        devices.assign(subscriptions.begin(), subscriptions.end());
-    }
-    BOOST_LOG_TRIVIAL(info) << "Orca diagnostic: sending current MQTT subscriptions count=" << devices.size();
-    if (!devices.empty()) {
-        const uint16_t packet_id = next_packet_id++;
-        BOOST_LOG_TRIVIAL(info) << "Orca diagnostic: sending SUBSCRIBE packet_id=" << packet_id;
-        send(websocket, make_topic_packet(0x82, packet_id, devices));
-    }
-}
-
-void OrcaCloudMqttConnection::send_pending_subscriptions(WebSocket& websocket) {
-    std::vector<std::string> subscribe_ids;
-    std::vector<std::string> unsubscribe_ids;
-    {
-        std::lock_guard<std::mutex> lock(mutex);
-        subscribe_ids.assign(pending_subscriptions.begin(), pending_subscriptions.end());
-        unsubscribe_ids.assign(pending_unsubscriptions.begin(), pending_unsubscriptions.end());
-        pending_subscriptions.clear();
-        pending_unsubscriptions.clear();
-    }
-    if (!subscribe_ids.empty()) {
-        const uint16_t packet_id = next_packet_id++;
-        BOOST_LOG_TRIVIAL(info) << "Orca diagnostic: sending pending SUBSCRIBE count=" << subscribe_ids.size()
-                                << " packet_id=" << packet_id;
-        for (const std::string& device_id : subscribe_ids)
-            BOOST_LOG_TRIVIAL(info) << "Orca diagnostic: SUBSCRIBE topic=" << report_topic(device_id);
-        send(websocket, make_topic_packet(0x82, packet_id, subscribe_ids));
-    }
-    if (!unsubscribe_ids.empty()) {
-        const uint16_t packet_id = next_packet_id++;
-        BOOST_LOG_TRIVIAL(info) << "Orca diagnostic: sending pending UNSUBSCRIBE count=" << unsubscribe_ids.size()
-                                << " packet_id=" << packet_id;
-        for (const std::string& device_id : unsubscribe_ids)
-            BOOST_LOG_TRIVIAL(info) << "Orca diagnostic: UNSUBSCRIBE topic=" << report_topic(device_id);
-        send(websocket, make_topic_packet(0xa2, packet_id, unsubscribe_ids));
-    }
-}
-
-void OrcaCloudMqttConnection::handle_packet(const std::string& packet) {
-    if (packet.size() < 2) {
-        BOOST_LOG_TRIVIAL(warning) << "Orca diagnostic: received undersized MQTT packet bytes=" << packet.size();
-        return;
-    }
-    const uint8_t header = static_cast<uint8_t>(packet[0]);
-    const uint8_t packet_type = header >> 4;
-    BOOST_LOG_TRIVIAL(info) << "Orca diagnostic: received MQTT packet type=" << static_cast<unsigned int>(packet_type)
-                            << " header=0x" << std::hex << static_cast<unsigned int>(header) << std::dec
-                            << " bytes=" << packet.size();
-    if (packet_type != 3) { // Only QoS 0 PUBLISH carries printer status.
-        if (packet_type == 9 && packet.size() >= 5) {
-            std::ostringstream result_codes;
-            for (size_t index = 4; index < packet.size(); ++index) {
-                if (index != 4)
-                    result_codes << ',';
-                result_codes << "0x" << std::hex << static_cast<unsigned int>(static_cast<uint8_t>(packet[index]));
-            }
-            BOOST_LOG_TRIVIAL(info) << "Orca diagnostic: received SUBACK packet_id="
-                                    << ((static_cast<unsigned int>(static_cast<uint8_t>(packet[2])) << 8) |
-                                        static_cast<unsigned int>(static_cast<uint8_t>(packet[3])))
-                                    << " result_codes=" << result_codes.str();
-        }
-        return;
-    }
-    size_t index = 1;
-    size_t multiplier = 1;
-    size_t remaining = 0;
-    uint8_t encoded = 0;
-    do {
-        if (index >= packet.size() || multiplier > 128 * 128 * 128) {
-            BOOST_LOG_TRIVIAL(warning) << "Orca diagnostic: malformed MQTT PUBLISH remaining length";
-            return;
-        }
-        encoded = static_cast<uint8_t>(packet[index++]);
-        remaining += (encoded & 0x7f) * multiplier;
-        multiplier *= 128;
-    } while ((encoded & 0x80) != 0);
-    const size_t remaining_end = index + remaining;
-    if (remaining_end > packet.size() || remaining < 2 || index + 2 > remaining_end) {
-        BOOST_LOG_TRIVIAL(warning) << "Orca diagnostic: malformed MQTT PUBLISH body remaining=" << remaining
-                                   << " packet_bytes=" << packet.size();
-        return;
-    }
-    const uint16_t topic_length = (static_cast<uint8_t>(packet[index]) << 8) |
-                                  static_cast<uint8_t>(packet[index + 1]);
-    index += 2;
-    if (topic_length > packet.size() - index) {
-        BOOST_LOG_TRIVIAL(warning) << "Orca diagnostic: malformed MQTT PUBLISH topic length=" << topic_length;
-        return;
-    }
-    const std::string topic(packet.data() + index, topic_length);
-    index += topic_length;
-    if (((header >> 1) & 0x03) != 0) {
-        if (index + 2 > remaining_end) {
-            BOOST_LOG_TRIVIAL(warning) << "Orca diagnostic: malformed MQTT PUBLISH packet identifier";
-            return;
-        }
-        index += 2; // QoS 1/2 packet identifier; the service currently sends QoS 0.
-    }
-    const size_t payload_size = remaining_end - index;
-    BOOST_LOG_TRIVIAL(info) << "Orca diagnostic: received PUBLISH topic=" << topic
-                            << " payload_bytes=" << payload_size
-                            << " message_callback=" << (on_message ? "set" : "null");
-    if (on_message)
-        on_message(topic, packet.substr(index, remaining_end - index));
-    else
-        BOOST_LOG_TRIVIAL(warning) << "Orca diagnostic: dropping PUBLISH because message callback is not set";
-}
-
-void OrcaCloudMqttConnection::notify_state(bool is_now_connected) {
-    StateHandler callback;
-    bool initial = false;
-    {
-        std::lock_guard<std::mutex> lock(mutex);
-        connected = is_now_connected;
-        initial   = !initial_completed;
-        if (initial) {
-            initial_result    = is_now_connected;
-            initial_completed = true;
-        }
-        callback = on_state;
-    }
-    BOOST_LOG_TRIVIAL(info) << "Orca diagnostic: MQTT state changed connected=" << is_now_connected
-                            << " initial=" << initial << " state_callback=" << (callback ? "set" : "null");
-    if (initial)
-        initial_cv.notify_all();
-    else if (callback)
-        callback(is_now_connected, false);
-}
-
-void OrcaCloudMqttConnection::run() {
-    while (!stopping.load()) {
-        const int retry_seconds = reconnect_delay_seconds.load();
-        try {
-            BOOST_LOG_TRIVIAL(info) << "Orca diagnostic: MQTT connection attempt retry_delay=" << retry_seconds;
-            connect_and_read();
-        } catch (const std::exception& error) {
-            BOOST_LOG_TRIVIAL(warning) << "Orca diagnostic: MQTT connection attempt failed: " << error.what();
-            if (!stopping.load())
-                notify_state(false);
-        }
-        if (stopping.load())
-            break;
-        // Grow the backoff only across attempts that never reached CONNACK; a
-        // successful connection resets reconnect_delay_seconds to 1 (connect_and_read).
-        reconnect_delay_seconds.store(std::min(retry_seconds * 2, 30));
-        std::unique_lock<std::mutex> lock(mutex);
-        BOOST_LOG_TRIVIAL(info) << "Orca diagnostic: MQTT waiting before reconnect seconds=" << retry_seconds;
-        state_cv.wait_for(lock, std::chrono::seconds(retry_seconds), [this] { return stopping.load(); });
-    }
-}
-
 namespace {
 constexpr const char* ORCA_DEFAULT_API_URL   = "api.orcaslicer.com";
 constexpr const char* ORCA_DEFAULT_AUTH_URL  = "https://auth.orcaslicer.com";
@@ -1013,7 +497,7 @@ OrcaCloudServiceAgent::OrcaCloudServiceAgent(std::string log_dir)
     , api_base_url(ORCA_DEFAULT_API_URL)
     , auth_base_url(ORCA_DEFAULT_AUTH_URL)
     , cloud_base_url(ORCA_DEFAULT_CLOUD_URL)
-    , mqtt_connection(std::make_unique<OrcaCloudMqttConnection>())
+    , mqtt_connection(std::make_unique<OrcaMqttConnection>())
 {
     auth_headers["apikey"]    = ORCA_DEFAULT_PUB_KEY;
     pkce_bundle.loopback_port = choose_loopback_port();
@@ -1487,79 +971,22 @@ int OrcaCloudServiceAgent::connect_server()
     BOOST_LOG_TRIVIAL(info) << "Orca diagnostic: cloud health result=" << result << " http_code=" << http_code
                             << " connected=" << connected << " response_bytes=" << response.size();
 
-    if (connected && mqtt_connection && !mqtt_connection->is_running()) {
-        // Only (re)start when the worker isn't already alive. connect_server() is
-        // also called every ~5s by DeviceManagerRefresher::on_timer via
-        // refresh_connection(); start() begins with stop(), so calling it
-        // unconditionally tears down and rebuilds a healthy socket every tick.
-        const std::string endpoint = "wss://" + api_base_url + "/api/v1/printers/mqtt";
-        BOOST_LOG_TRIVIAL(info) << "Orca diagnostic: starting aggregate MQTT endpoint=" << endpoint;
-        // Fire-and-forget: start() spawns a worker that reconnects with exponential
-        // backoff. A failed *initial* attempt (token/network not ready yet during a
-        // startup gap) must NOT gate the socket's lifetime here — folding it into
-        // `connected` trips the stop() below and kills the retry loop for the whole
-        // session. The socket is torn down only on logout / clear_session.
-        const bool mqtt_started = mqtt_connection->start(
-            endpoint,
-            [this] { return get_access_token(); },
-            [this](const std::string& topic, const std::string& message) {
-                constexpr const char* prefix = "device/";
-                constexpr const char* suffix = "/report";
-                if (topic.compare(0, 7, prefix) != 0 || topic.size() <= 14 ||
-                    topic.compare(topic.size() - 7, 7, suffix) != 0)
-                    return;
-                const std::string device_id = topic.substr(7, topic.size() - 14);
-                OnMessageFn callback;
-                {
-                    std::lock_guard<std::mutex> lock(callback_mutex);
-                    callback = printer_status_callback;
-                }
-                if (callback)
-                    callback(device_id, message);
-            },
-            [this](bool socket_connected, bool initial) {
-                BOOST_LOG_TRIVIAL(info) << "Orca diagnostic: aggregate MQTT state callback connected="
-                                        << socket_connected << " initial=" << initial;
-                if (initial)
-                    return;
-                {
-                    std::lock_guard<std::recursive_mutex> lock(state_mutex);
-                    is_connected = socket_connected;
-                }
-                invoke_server_connected_callback(socket_connected ? 0 : -1, 0);
-            });
-        BOOST_LOG_TRIVIAL(info) << "Orca diagnostic: aggregate MQTT start returned=" << mqtt_started;
+    // connect_server() is a REST health probe only. The long-lived MQTT socket is
+    // per-printer now, driven by set_user_selected_machine ->
+    // configure_selected_printer_mqtt; this method must not touch mqtt_connection.
+    {
+        std::lock_guard<std::recursive_mutex> lock(state_mutex);
+        is_connected = connected;
     }
-    if (!connected) {
-        // Transient health-check failure (DNS blip / brief 5xx). Do NOT stop the
-        // MQTT worker — it owns its own reconnect loop, and connect_server() runs
-        // on the 5s refresher tick. The socket is torn down only on logout (the
-        // !logged_in branch above) and clear_session().
-        BOOST_LOG_TRIVIAL(info) << "Orca diagnostic: cloud health check failed; leaving aggregate MQTT running";
-    }
-
-    // While the aggregate MQTT worker is alive it owns is_connected via its
-    // StateHandler. Don't let the 5s health probe overwrite it (a DNS blip would
-    // otherwise flap the "server connected" state and the Device tab).
-    const bool mqtt_alive = mqtt_connection && mqtt_connection->is_running();
-    if (!mqtt_alive) {
-        {
-            std::lock_guard<std::recursive_mutex> lock(state_mutex);
-            is_connected = connected;
-        }
-        invoke_server_connected_callback(connected ? 0 : -1, http_code);
-    }
-
-    return (connected || mqtt_alive) ? BAMBU_NETWORK_SUCCESS : BAMBU_NETWORK_ERR_CONNECTION_TO_SERVER_FAILED;
+    invoke_server_connected_callback(connected ? 0 : -1, http_code);
+    return connected ? BAMBU_NETWORK_SUCCESS : BAMBU_NETWORK_ERR_CONNECTION_TO_SERVER_FAILED;
 }
 
 bool OrcaCloudServiceAgent::is_server_connected()
 {
-    // The aggregate MQTT socket is the real signal. While its worker is alive,
-    // report its actual CONNACK state — immune to the 5s health probe's DNS blips.
-    // Fall back to the last health-check result only when there is no socket.
-    if (mqtt_connection && mqtt_connection->is_running())
-        return mqtt_connection->is_connected();
+    // The REST health probe is the signal; the per-printer MQTT socket does not gate
+    // whole-cloud connectivity (one printer reconnecting must not report the whole
+    // cloud as lost).
     std::lock_guard<std::recursive_mutex> lock(state_mutex);
     return is_connected;
 }
@@ -1586,7 +1013,9 @@ int OrcaCloudServiceAgent::add_subscribe(std::vector<std::string> dev_list)
         BOOST_LOG_TRIVIAL(warning) << "Orca diagnostic: add_subscribe rejected because cloud is not ready";
         return BAMBU_NETWORK_ERR_INVALID_HANDLE;
     }
-    const bool queued = mqtt_connection->subscribe(dev_list);
+    bool queued = true;
+    for (const std::string& dev_id : dev_list)
+        queued = mqtt_connection->subscribe(dev_id) && queued;
     BOOST_LOG_TRIVIAL(info) << "Orca diagnostic: add_subscribe queued=" << queued;
     return queued ? BAMBU_NETWORK_SUCCESS : BAMBU_NETWORK_ERR_CONNECT_FAILED;
 }
@@ -1599,9 +1028,66 @@ int OrcaCloudServiceAgent::del_subscribe(std::vector<std::string> dev_list)
         BOOST_LOG_TRIVIAL(warning) << "Orca diagnostic: del_subscribe rejected because cloud is not ready";
         return BAMBU_NETWORK_ERR_INVALID_HANDLE;
     }
-    const bool queued = mqtt_connection->unsubscribe(dev_list);
+    bool queued = true;
+    for (const std::string& dev_id : dev_list)
+        queued = mqtt_connection->unsubscribe(dev_id) && queued;
     BOOST_LOG_TRIVIAL(info) << "Orca diagnostic: del_subscribe queued=" << queued;
     return queued ? BAMBU_NETWORK_SUCCESS : BAMBU_NETWORK_ERR_CONNECT_FAILED;
+}
+
+int OrcaCloudServiceAgent::configure_selected_printer_mqtt(const std::string& dev_id)
+{
+    OrcaMqttConnection::Config cfg;
+    cfg.url               = "wss://" + api_base_url + "/api/v1/printers/" + dev_id + "/mqtt";
+    cfg.use_tls           = true;
+    cfg.bearer_provider   = [this] { return get_access_token(); };
+    cfg.client_id         = "OrcaSlicer";
+    cfg.keepalive_seconds = 300;
+
+    {
+        std::lock_guard<std::mutex> lock(m_selected_url_mutex);
+        m_selected_printer_mqtt_url = cfg.url;
+    }
+    BOOST_LOG_TRIVIAL(info) << "Orca diagnostic: configuring per-printer MQTT endpoint=" << cfg.url;
+
+    // NOTE: no lock is held across start() — it blocks for the whole initial connect
+    // attempt (up to ~10s), and the message handler below re-enters callback_mutex on
+    // the MQTT worker thread.
+    const bool ok = mqtt_connection->start(
+        cfg,
+        [this](const std::string& id, const std::string& payload) { deliver_cloud_message(id, payload); },
+        [this](bool, bool) {});
+    BOOST_LOG_TRIVIAL(info) << "Orca diagnostic: per-printer MQTT start returned=" << ok;
+    return ok ? BAMBU_NETWORK_SUCCESS : BAMBU_NETWORK_ERR_CONNECTION_TO_SERVER_FAILED;
+}
+
+void OrcaCloudServiceAgent::teardown_selected_printer_mqtt()
+{
+    if (mqtt_connection) {
+        mqtt_connection->stop();
+        // The connection object is reused for the next printer; drop this printer's
+        // report topic so its 1:1 socket does not re-subscribe the previous device.
+        mqtt_connection->clear_subscriptions();
+    }
+    std::lock_guard<std::mutex> lock(m_selected_url_mutex);
+    m_selected_printer_mqtt_url.clear();
+}
+
+std::string OrcaCloudServiceAgent::selected_printer_mqtt_url() const
+{
+    std::lock_guard<std::mutex> lock(m_selected_url_mutex);
+    return m_selected_printer_mqtt_url;
+}
+
+void OrcaCloudServiceAgent::deliver_cloud_message(const std::string& dev_id, const std::string& payload)
+{
+    OnMessageFn callback;
+    {
+        std::lock_guard<std::mutex> lock(callback_mutex);
+        callback = printer_status_callback;
+    }
+    if (callback)
+        callback(dev_id, payload);
 }
 
 int OrcaCloudServiceAgent::set_printer_status_callback(OnMessageFn fn)
@@ -3293,6 +2779,15 @@ int OrcaCloudServiceAgent::get_user_print_info(unsigned int* http_code, std::str
 
         for (const auto& printer : resp_json.value("data", nlohmann::json::array())) {
             nlohmann::json device;
+            std::string role = printer.value("access_role", "");
+
+            // A printer with the role "view" only has monitoring access for orca cloud.
+            // The printer is owned by a different person and was shared to the current user without
+            // any permission to control the printer so we discard this printer. Comment this out if 
+            // OrcaSlicer wants to support view only printers.
+            if (role.empty() || role == "viewer")
+                continue;
+
             device["dev_id"]   = printer.value("id", "");
             device["dev_name"] = printer.value("name", "");
             if (printer.contains("model") && printer["model"].is_string())
