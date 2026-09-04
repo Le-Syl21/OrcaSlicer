@@ -18,12 +18,13 @@ namespace Slic3r {
 class OrcaCloudServiceAgent;
 
 /**
- * OrcaPrinterAgent - Stub implementation for printer operations.
+ * OrcaPrinterAgent - OrcaSonar MQTT printer agent.
  *
- * All printer-related operations are currently stubs that return success.
- * Actual printer connectivity requires the BBL SDK or future Orca implementation.
+ * LAN and cloud commands use the same OrcaSonar protocol payloads; only the
+ * MQTT connection selected by route_send() differs.
  */
-class OrcaPrinterAgent : public IPrinterAgent {
+class OrcaPrinterAgent : public IPrinterAgent
+{
 public:
     explicit OrcaPrinterAgent(std::string log_dir);
     ~OrcaPrinterAgent() override;
@@ -50,11 +51,20 @@ public:
     // Binding
     int ping_bind(std::string ping_code) override;
     int bind_detect(std::string dev_ip, std::string sec_link, detectResult& detect) override;
-    int bind(std::string dev_ip, std::string dev_id, std::string dev_model, std::string sec_link, std::string timezone, bool improved, OnUpdateStatusFn update_fn) override;
+    int bind(std::string dev_ip,
+             std::string dev_id,
+             std::string dev_model,
+             std::string sec_link,
+             std::string timezone,
+             bool improved,
+             OnUpdateStatusFn update_fn) override;
     int unbind(std::string dev_id) override;
     int request_bind_ticket(std::string* ticket) override;
     int get_hms_snapshot(std::string dev_id, std::string file_name, std::function<void(std::string, int)> callback) override;
     int set_server_callback(OnServerErrFn fn) override;
+
+    CameraStreamMode get_camera_stream_mode() const override;
+    std::string get_camera_url() const override;
 
     // Machine Selection
     std::string get_user_selected_machine() override;
@@ -85,9 +95,29 @@ public:
     int set_on_local_message_fn(OnMessageFn fn) override;
     int set_queue_on_main_fn(QueueOnMainFn fn) override;
 
+    int command_ams_refresh_rfid(std::string dev_id, std::string tray_id, int sequence_id, bool lan_mode) override;
+    int command_ams_calibrate(std::string dev_id, int ams_id, int sequence_id, bool lan_mode) override;
+    int command_ams_select_tray(std::string dev_id, std::string tray_id, int sequence_id, bool lan_mode) override;
+    int command_start_camera(std::string dev_id) override;
+    int command_xyz_abs(std::string dev_id, int sequence_id, bool lan_mode) override;
+    int command_auto_leveling(std::string dev_id, int sequence_id, bool lan_mode) override;
+    int command_go_home(std::string dev_id, bool is_printing, bool supports_mqtt_homing, int sequence_id, bool lan_mode) override;
+    int command_set_bed(std::string dev_id, int temp, bool supports_mqtt_bed_ctrl, int sequence_id, bool lan_mode) override;
+    int command_set_nozzle(std::string dev_id, int temp, int sequence_id, bool lan_mode) override;
+    int command_axis_control(std::string dev_id,
+                             std::string axis,
+                             double unit,
+                             double input_val,
+                             int speed,
+                             bool is_core_xy,
+                             bool supports_mqtt_axis_control,
+                             int sequence_id,
+                             bool lan_mode) override;
+
     // Test-only: drive emit_connect_sequence directly (no socket).
-    void run_connect_sequence_for_test(const std::string& dev_id) {
-        emit_connect_sequence(dev_id, [](const std::string&){}, [](const std::string&){});
+    void run_connect_sequence_for_test(const std::string& dev_id)
+    {
+        emit_connect_sequence(dev_id, [](const std::string&) {}, [](const std::string&) {});
     }
 
     // Test-only: advance the LAN connection epoch without a connect/disconnect cycle.
@@ -99,6 +129,10 @@ protected:
     // Forward one inbound printer message to on_message_fn (marshalled onto the UI
     // thread via queue_on_main_fn when set). Body of every connection's MessageHandler.
     void deliver_to_sink(const std::string& dev_id, const std::string& payload);
+
+    // Extract OrcaSonar's print.ipcam.stream_mode from LAN reports before they
+    // are forwarded to the GUI. The getters below then read this agent-owned state.
+    void parse_ipcam_info(const std::string& dev_id, const std::string& payload);
 
     // LAN has a separate callback in the existing IPrinterAgent contract because the
     // GUI parses local reports with the "lan" dialect and looks up local machines.
@@ -114,10 +148,10 @@ protected:
     std::function<void(const std::string&, const std::string&)> make_lan_message_handler(uint64_t generation);
 
     // Pure LAN-address parsing + client-id. protected static so the test Probe reaches them.
-    static bool        parse_lan_endpoint(const std::string& dev_ip, std::string& host, std::string& port);
+    static bool parse_lan_endpoint(const std::string& dev_ip, std::string& host, std::string& port);
     static std::string make_lan_client_id(const std::string& dev_id);
     // Test hook: the ws:// URL connect_printer built for the current LAN session ("" if none).
-    std::string        lan_connection_target() const;
+    std::string lan_connection_target() const;
     // Shared post-connect sequence: SUBSCRIBE, then pushing.start, pushall,
     // info.get_version, info.get_capabilities. Runs identically on LAN and cloud.
     void on_connected(const std::string& dev_id, OrcaMqttConnection* conn, uint64_t generation);
@@ -127,7 +161,7 @@ protected:
     virtual void emit_connect_sequence(const std::string& dev_id,
                                        std::function<void(const std::string&)> subscribe,
                                        std::function<void(const std::string&)> request);
-    static std::string seq(int n);   // decimal string in the OrcaSlicer 20000..29999 band
+    static std::string seq(int n); // decimal string in the OrcaSlicer 20000..29999 band
     static std::string build_pushing_start(const std::string& sequence_id);
     static std::string build_pushing_stop(const std::string& sequence_id);
     static std::string build_pushall(const std::string& sequence_id);
@@ -140,11 +174,12 @@ private:
     std::string log_dir;
     std::string selected_machine;
 
-    enum CurrentConn {
-        NONE,
-        CLOUD,
-        LAN
-    };
+    enum CurrentConn { NONE, CLOUD, LAN };
+    static const char* connection_type_name(CurrentConn connection);
+
+    // The transport for the printer currently selected by the UI.  LAN and
+    // cloud sessions have separate connection objects, so this is selection
+    // state rather than an inference from whichever socket happens to exist.
     CurrentConn m_current_connection = NONE;
 
     std::shared_ptr<ICloudServiceAgent> m_cloud_agent;
@@ -164,12 +199,15 @@ private:
 
     std::unique_ptr<OrcaSonarDiscovery> m_discovery;
 
-    std::string           m_lan_dev_id;   // guarded by state_mutex
-    std::string           m_lan_url;      // guarded by state_mutex — the Config.url of the live LAN session
+    std::string m_lan_dev_id; // guarded by state_mutex
+    std::string m_lan_url;    // guarded by state_mutex — the Config.url of the live LAN session
+    CameraStreamMode m_camera_stream_mode = CameraStreamMode::none; // guarded by state_mutex
+    std::string m_camera_url; // guarded by state_mutex
 
     OrcaCloudServiceAgent* get_orca_cloud_agent();
 
     OrcaMqttConnection* get_appropriate_mqtt_connection(bool is_lan = true);
+    static bool parse_nonnegative_command_id(const std::string& value, int& result);
 
     // Route one command payload to device/<dev_id>/request on the LAN or the cloud
     // per-printer connection. The uniform send path for both send_message* overrides.

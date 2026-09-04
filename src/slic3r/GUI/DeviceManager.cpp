@@ -3047,6 +3047,13 @@ int MachineObject::parse_json(std::string tunnel, std::string payload, bool key_
         } catch (...) {}
 
         try {
+            if (j.contains("info"))
+                parse_new_info2(j["info"]);
+        } catch (...) {
+            BOOST_LOG_TRIVIAL(error) << "parse_json: failed to parse OrcaSonar capability info";
+        }
+
+        try {
             if (auto ptr = m_fila_system->GetAmsFirmwareSwitch().lock()) {
                 ptr->ParseFirmwareSwitch(j);
             }
@@ -5430,6 +5437,86 @@ void MachineObject::parse_new_info(json print)
             }
         }
     }
+}
+
+void MachineObject::parse_new_info2(const json& info)
+{
+    if (!info.is_object() || info.value("command", "") != "get_capabilities")
+        return;
+
+    const auto capabilities_it = info.find("capabilities");
+    if (capabilities_it == info.end() || !capabilities_it->is_object())
+        return;
+    const auto flags_it = capabilities_it->find("flags");
+    if (flags_it == capabilities_it->end() || !flags_it->is_object())
+        return;
+
+    const json& flags = *flags_it;
+    BOOST_LOG_TRIVIAL(info) << "parse_new_info2: OrcaSonar capability flags=" << flags.dump();
+
+    auto parse_bool = [&flags](const char* name, bool& target) {
+        const auto it = flags.find(name);
+        if (it != flags.end() && it->is_boolean())
+            target = it->get<bool>();
+    };
+
+    parse_bool("support_send_to_sd", is_support_send_to_sdcard);
+    parse_bool("support_filament_backup", is_support_filament_backup);
+    parse_bool("support_update_remain", is_support_update_remain);
+    parse_bool("support_auto_recovery_step_loss", is_support_auto_recovery_step_loss);
+    parse_bool("support_ams_humidity", is_support_ams_humidity);
+    parse_bool("support_prompt_sound", is_support_prompt_sound);
+    parse_bool("support_filament_tangle_detect", is_support_filament_tangle_detect);
+    parse_bool("support_1080dpi", is_support_1080dpi);
+    parse_bool("support_cloud_print_only", is_support_cloud_print_only);
+    parse_bool("support_command_ams_switch", is_support_command_ams_switch);
+    parse_bool("support_mqtt_alive", is_support_mqtt_alive);
+    parse_bool("support_motor_noise_cali", is_support_motor_noise_cali);
+    parse_bool("support_timelapse", is_support_timelapse);
+    parse_bool("support_user_preset", is_support_user_preset);
+    parse_bool("support_refresh_nozzle", is_support_refresh_nozzle);
+    parse_bool("support_flow_calibration", is_support_flow_calibration);
+    parse_bool("support_build_plate_marker_detect", is_support_build_plate_marker_detect);
+    parse_bool("support_nozzle_blob_detect", is_support_nozzle_blob_detection);
+
+    if (!m_manager->IsMultiMachineEnabled() && !is_support_agora)
+        parse_bool("support_tunnel_mqtt", is_support_tunnel_mqtt);
+
+    const auto bed_leveling_it = flags.find("support_bed_leveling");
+    if (bed_leveling_it != flags.end() && bed_leveling_it->is_number_integer())
+        is_support_bed_leveling = bed_leveling_it->get<int>();
+
+    auto copy_bool = [&flags](json& target, const char* name) {
+        const auto it = flags.find(name);
+        if (it != flags.end() && it->is_boolean())
+            target[name] = *it;
+    };
+
+    // The capability manifest uses an object for this range, while the legacy
+    // DeviceCore parser consumes a boolean plus a two-element range array.
+    json device_config;
+    copy_bool(device_config, "support_chamber");
+    copy_bool(device_config, "support_first_layer_inspect");
+    copy_bool(device_config, "support_ai_monitoring");
+    copy_bool(device_config, "support_lidar_calibration");
+    const auto chamber_edit_it = flags.find("support_chamber_temp_edit");
+    if (chamber_edit_it != flags.end() && chamber_edit_it->is_boolean()) {
+        device_config["support_chamber_temp_edit"] = *chamber_edit_it;
+    } else if (chamber_edit_it != flags.end() && chamber_edit_it->is_object()) {
+        const auto min_it = chamber_edit_it->find("min");
+        const auto max_it = chamber_edit_it->find("max");
+        if (min_it != chamber_edit_it->end() && max_it != chamber_edit_it->end() && min_it->is_number() && max_it->is_number()) {
+            device_config["support_chamber_temp_edit"]       = true;
+            device_config["support_chamber_temp_edit_range"] = {*min_it, *max_it};
+        }
+    }
+
+    json fan_config;
+    copy_bool(fan_config, "support_aux_fan");
+    copy_bool(fan_config, "support_chamber_fan");
+
+    m_config->ParseConfig(device_config);
+    m_fan->ParseV2_0(fan_config);
 }
 
 static bool is_hex_digit(char c) {

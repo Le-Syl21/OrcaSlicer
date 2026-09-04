@@ -125,6 +125,9 @@ void OrcaMqttConnection::stop() {
     {
         std::lock_guard<std::mutex> lock(mutex);
         connected = false;
+        acknowledged_subscriptions.clear();
+        pending_subscribe_packets.clear();
+        pending_requests.clear();
         if (!initial_completed) {
             initial_completed = true;
             initial_result    = false;
@@ -173,6 +176,11 @@ bool OrcaMqttConnection::subscribe(const std::string& dev_id) {
     }
     {
         std::lock_guard<std::mutex> lock(mutex);
+        if (subscriptions.count(topic) != 0 && pending_unsubscriptions.count(topic) == 0) {
+            BOOST_LOG_TRIVIAL(info) << "Orca diagnostic: MQTT subscribe already queued or active topic=" << topic
+                                    << " acknowledged=" << (acknowledged_subscriptions.count(topic) != 0);
+            return true;
+        }
         subscriptions.insert(topic);
         pending_unsubscriptions.erase(topic);
         pending_subscriptions.insert(topic);
@@ -190,8 +198,21 @@ bool OrcaMqttConnection::unsubscribe(const std::string& dev_id) {
     {
         std::lock_guard<std::mutex> lock(mutex);
         subscriptions.erase(topic);
+        acknowledged_subscriptions.erase(topic);
         pending_subscriptions.erase(topic);
         pending_unsubscriptions.insert(topic);
+        for (auto it = pending_subscribe_packets.begin(); it != pending_subscribe_packets.end();) {
+            if (it->second == topic)
+                it = pending_subscribe_packets.erase(it);
+            else
+                ++it;
+        }
+        for (auto it = pending_requests.begin(); it != pending_requests.end();) {
+            if (it->first == dev_id)
+                it = pending_requests.erase(it);
+            else
+                ++it;
+        }
         BOOST_LOG_TRIVIAL(info) << "Orca diagnostic: MQTT unsubscribe queued topic=" << topic
                                 << " total_subscriptions=" << subscriptions.size()
                                 << " connected=" << connected.load();
@@ -207,6 +228,9 @@ void OrcaMqttConnection::clear_subscriptions() {
     subscriptions.clear();
     pending_subscriptions.clear();
     pending_unsubscriptions.clear();
+    acknowledged_subscriptions.clear();
+    pending_subscribe_packets.clear();
+    pending_requests.clear();
 }
 
 bool OrcaMqttConnection::parse_endpoint(const std::string& url, Endpoint& endpoint) {
@@ -450,6 +474,17 @@ bool OrcaMqttConnection::send_request(const std::string& dev_id, const std::stri
                                    << " dev_id=" << dev_id;
         return false;
     }
+    const std::string report = report_topic(dev_id);
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (subscriptions.count(report) != 0 && acknowledged_subscriptions.count(report) == 0) {
+            pending_requests.emplace_back(dev_id, payload);
+            BOOST_LOG_TRIVIAL(info) << "Orca diagnostic: MQTT request queued until SUBACK"
+                                    << " dev_id=" << dev_id << " payload_bytes=" << payload.size()
+                                    << " pending_requests=" << pending_requests.size();
+            return true;
+        }
+    }
     try {
         // ws_write() serialises the write via write_mutex; do not lock it here.
         BOOST_LOG_TRIVIAL(info) << "Orca diagnostic: MQTT PUBLISH request dev_id=" << dev_id
@@ -531,6 +566,14 @@ void OrcaMqttConnection::connect_and_read() {
     }
 
     m_connection_stage = "reading MQTT messages";
+    // The subscription acknowledgement belongs to this MQTT session. Clear
+    // the previous session's state before notifying the owner, because the
+    // reconnect callback immediately queues the printer's initial requests.
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        acknowledged_subscriptions.clear();
+        pending_subscribe_packets.clear();
+    }
     notify_state(true);
     reconnect_delay_seconds.store(1); // a fresh CONNACK resets the backoff
     BOOST_LOG_TRIVIAL(info) << "Orca diagnostic: MQTT connection is ready; sending current subscriptions";
@@ -572,10 +615,18 @@ void OrcaMqttConnection::send_current_subscriptions(Connection& conn) {
     {
         std::lock_guard<std::mutex> lock(mutex);
         topics.assign(subscriptions.begin(), subscriptions.end());
+        acknowledged_subscriptions.clear();
+        pending_subscribe_packets.clear();
+        for (const std::string& topic : topics)
+            pending_subscriptions.erase(topic);
     }
     BOOST_LOG_TRIVIAL(info) << "Orca diagnostic: sending current MQTT subscriptions count=" << topics.size();
     for (const std::string& topic : topics) {
         const uint16_t packet_id = next_packet_id++;
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            pending_subscribe_packets[packet_id] = topic;
+        }
         BOOST_LOG_TRIVIAL(info) << "Orca diagnostic: sending SUBSCRIBE topic=" << topic << " packet_id=" << packet_id;
         ws_write(conn, make_subscribe_packet(packet_id, topic, 1));
     }
@@ -593,6 +644,10 @@ void OrcaMqttConnection::send_pending_subscriptions(Connection& conn) {
     }
     for (const std::string& topic : subscribe_topics) {
         const uint16_t packet_id = next_packet_id++;
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            pending_subscribe_packets[packet_id] = topic;
+        }
         BOOST_LOG_TRIVIAL(info) << "Orca diagnostic: sending pending SUBSCRIBE topic=" << topic
                                 << " packet_id=" << packet_id;
         ws_write(conn, make_subscribe_packet(packet_id, topic, 1));
@@ -617,6 +672,8 @@ void OrcaMqttConnection::handle_packet(const std::string& packet) {
                             << " bytes=" << packet.size();
     if (packet_type != 3) { // Only QoS 0 PUBLISH carries printer status.
         if (packet_type == 9 && packet.size() >= 5) {
+            const uint16_t packet_id = (static_cast<unsigned int>(static_cast<uint8_t>(packet[2])) << 8) |
+                                       static_cast<unsigned int>(static_cast<uint8_t>(packet[3]));
             std::ostringstream result_codes;
             for (size_t index = 4; index < packet.size(); ++index) {
                 if (index != 4)
@@ -624,9 +681,51 @@ void OrcaMqttConnection::handle_packet(const std::string& packet) {
                 result_codes << "0x" << std::hex << static_cast<unsigned int>(static_cast<uint8_t>(packet[index]));
             }
             BOOST_LOG_TRIVIAL(info) << "Orca diagnostic: received SUBACK packet_id="
-                                    << ((static_cast<unsigned int>(static_cast<uint8_t>(packet[2])) << 8) |
-                                        static_cast<unsigned int>(static_cast<uint8_t>(packet[3])))
+                                    << packet_id
                                     << " result_codes=" << result_codes.str();
+
+            // Each production SUBSCRIBE packet currently contains one topic.
+            // MQTT grants QoS 0 or 1 for a requested QoS 1 subscription; 0x80
+            // means the subscription was rejected.
+            const uint8_t result = static_cast<uint8_t>(packet[4]);
+            std::string topic;
+            std::deque<std::pair<std::string, std::string>> requests;
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                auto pending = pending_subscribe_packets.find(packet_id);
+                if (pending != pending_subscribe_packets.end()) {
+                    topic = pending->second;
+                    pending_subscribe_packets.erase(pending);
+                    for (auto it = pending_requests.begin(); it != pending_requests.end();) {
+                        if (report_topic(it->first) == topic) {
+                            requests.push_back(std::move(*it));
+                            it = pending_requests.erase(it);
+                        } else {
+                            ++it;
+                        }
+                    }
+                    if (result == 0 || result == 1) {
+                        acknowledged_subscriptions.insert(topic);
+                    }
+                }
+            }
+            if (topic.empty()) {
+                BOOST_LOG_TRIVIAL(warning) << "Orca diagnostic: SUBACK has no pending topic packet_id=" << packet_id;
+            } else if (result == 0 || result == 1) {
+                BOOST_LOG_TRIVIAL(info) << "Orca diagnostic: report subscription active topic=" << topic
+                                        << " granted_qos=" << static_cast<unsigned int>(result)
+                                        << " releasing_requests=" << requests.size();
+                for (const auto& request : requests) {
+                    if (!send_request(request.first, request.second)) {
+                        BOOST_LOG_TRIVIAL(warning) << "Orca diagnostic: queued MQTT request could not be sent"
+                                                   << " after SUBACK dev_id=" << request.first;
+                    }
+                }
+            } else {
+                BOOST_LOG_TRIVIAL(warning) << "Orca diagnostic: report subscription rejected topic=" << topic
+                                           << " result_code=0x" << std::hex << static_cast<unsigned int>(result) << std::dec
+                                           << " dropped_requests=" << requests.size();
+            }
         }
         return;
     }

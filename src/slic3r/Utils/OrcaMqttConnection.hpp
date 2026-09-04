@@ -7,13 +7,15 @@
 #include <boost/beast/websocket.hpp>
 #include <atomic>
 #include <condition_variable>
+#include <deque>
 #include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
-#include <optional>
 #include <set>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 #include <cstddef>
 #include <cstdint>
@@ -130,6 +132,12 @@ private:
     std::set<std::string> subscriptions;
     std::set<std::string> pending_subscriptions;
     std::set<std::string> pending_unsubscriptions;
+    // Requests for a subscribed device wait until the corresponding SUBACK is
+    // received. Otherwise an immediate pushall response can be published by
+    // the broker before this client is actually subscribed to the report topic.
+    std::set<std::string> acknowledged_subscriptions;
+    std::map<uint16_t, std::string> pending_subscribe_packets;
+    std::deque<std::pair<std::string, std::string>> pending_requests;
     std::atomic<uint16_t> next_packet_id{1};
     std::atomic<int> m_last_connack_rc{-1};
     uint64_t m_attempt_number{0};       // worker-thread diagnostic sequence

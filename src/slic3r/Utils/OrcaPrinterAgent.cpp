@@ -1,4 +1,5 @@
 #include "OrcaPrinterAgent.hpp"
+#include "IPrinterAgent.hpp"
 #include "NetworkAgentFactory.hpp"
 #include "OrcaCloudServiceAgent.hpp"
 #include <algorithm>
@@ -9,6 +10,8 @@
 #include <cctype>
 #include <cstdio>
 #include <condition_variable>
+#include <cmath>
+#include <limits>
 #include <mutex>
 #include <nlohmann/json.hpp>
 #include <random>
@@ -213,6 +216,16 @@ private:
 
 OrcaPrinterAgent::OrcaPrinterAgent(std::string log_dir) : log_dir(std::move(log_dir)) {}
 
+const char* OrcaPrinterAgent::connection_type_name(CurrentConn connection)
+{
+    switch (connection) {
+    case LAN: return "LAN";
+    case CLOUD: return "cloud";
+    case NONE: return "none";
+    }
+    return "unknown";
+}
+
 OrcaPrinterAgent::~OrcaPrinterAgent()
 {
     start_discovery(false, false);
@@ -300,6 +313,8 @@ void OrcaPrinterAgent::deliver_to_sink(const std::string& dev_id, const std::str
 
 void OrcaPrinterAgent::deliver_to_local_sink(const std::string& dev_id, const std::string& payload)
 {
+    parse_ipcam_info(dev_id, payload);
+
     OnMessageFn fn;
     QueueOnMainFn q;
     {
@@ -380,11 +395,140 @@ void OrcaPrinterAgent::set_cloud_agent(std::shared_ptr<ICloudServiceAgent> cloud
 }
 
 // ============================================================================
-// Communication - All Stubs
+// Communication
 // ============================================================================
 
 int OrcaPrinterAgent::send_message(std::string dev_id, std::string json_str, int /*qos*/, int /*flag*/)
 { return route_send(/*is_lan=*/false, dev_id, json_str); }
+
+int OrcaPrinterAgent::command_ams_refresh_rfid(std::string dev_id, std::string tray_id, int sequence_id, bool lan_mode)
+{
+    int tray_number = 0;
+    if (!parse_nonnegative_command_id(tray_id, tray_number)) {
+        BOOST_LOG_TRIVIAL(warning) << "OrcaPrinterAgent: invalid RFID tray id=" << tray_id;
+        return BAMBU_NETWORK_ERR_INVALID_HANDLE;
+    }
+
+    nlohmann::json j;
+    j["print"]["command"]     = "ams_get_rfid";
+    j["print"]["sequence_id"] = std::to_string(sequence_id);
+    j["print"]["tray_id"]     = tray_number;
+    return route_send(lan_mode, dev_id, j.dump());
+}
+
+int OrcaPrinterAgent::command_ams_calibrate(std::string /*dev_id*/, int /*ams_id*/, int /*sequence_id*/, bool /*lan_mode*/)
+{
+    // OrcaSonar has no ams_calibrate command. Do not send the Bambu M620 C
+    // dialect through the vendor-neutral OrcaSonar gcode_line command.
+    BOOST_LOG_TRIVIAL(info) << "OrcaPrinterAgent: AMS calibration is not part of the OrcaSonar API";
+    return ORCA_NETWORK_ERR_CMD_NOT_SUPPORTED;
+}
+
+int OrcaPrinterAgent::command_ams_select_tray(std::string dev_id, std::string tray_id, int sequence_id, bool lan_mode)
+{
+    int tray_number = 0;
+    if (!parse_nonnegative_command_id(tray_id, tray_number)) {
+        BOOST_LOG_TRIVIAL(warning) << "OrcaPrinterAgent: invalid AMS target tray id=" << tray_id;
+        return BAMBU_NETWORK_ERR_INVALID_HANDLE;
+    }
+
+    nlohmann::json j;
+    j["print"]["command"]     = "ams_change_filament";
+    j["print"]["sequence_id"] = std::to_string(sequence_id);
+    j["print"]["target"]      = tray_number;
+    return route_send(lan_mode, dev_id, j.dump());
+}
+
+int OrcaPrinterAgent::command_start_camera(std::string /*dev_id*/)
+{
+    // OrcaSonar exposes camera.ipcam_* controls, not the legacy start_camera
+    // operation used by the Bambu agent.
+    BOOST_LOG_TRIVIAL(info) << "OrcaPrinterAgent: camera start is not part of the OrcaSonar API";
+    return ORCA_NETWORK_ERR_CMD_NOT_SUPPORTED;
+}
+
+int OrcaPrinterAgent::command_xyz_abs(std::string dev_id, int sequence_id, bool lan_mode)
+{
+    nlohmann::json j;
+    j["print"]["command"]     = "gcode_line";
+    j["print"]["param"]       = "G90\n";
+    j["print"]["sequence_id"] = std::to_string(sequence_id);
+    return route_send(lan_mode, dev_id, j.dump());
+}
+
+int OrcaPrinterAgent::command_auto_leveling(std::string dev_id, int sequence_id, bool lan_mode)
+{
+    nlohmann::json j;
+    j["print"]["command"]     = "gcode_line";
+    j["print"]["param"]       = "G29\n";
+    j["print"]["sequence_id"] = std::to_string(sequence_id);
+    return route_send(lan_mode, dev_id, j.dump());
+}
+
+int OrcaPrinterAgent::command_go_home(std::string dev_id, bool is_printing, bool supports_mqtt_homing,
+                                      int sequence_id, bool lan_mode)
+{
+    nlohmann::json j;
+    j["print"]["sequence_id"] = std::to_string(sequence_id);
+    if (supports_mqtt_homing) {
+        j["print"]["command"] = "back_to_center";
+    } else {
+        // Preserve the existing safety behavior: never home Z/Y during a print.
+        j["print"]["command"] = "gcode_line";
+        j["print"]["param"]   = is_printing ? "G28 X\n" : "G28\n";
+    }
+    return route_send(lan_mode, dev_id, j.dump());
+}
+
+int OrcaPrinterAgent::command_set_bed(std::string dev_id, int temp, bool /*supports_mqtt_bed_ctrl*/,
+                                      int sequence_id, bool lan_mode)
+{
+    nlohmann::json j;
+    j["print"]["command"]     = "set_bed_temp";
+    j["print"]["sequence_id"] = std::to_string(sequence_id);
+    j["print"]["temp"]        = temp;
+    return route_send(lan_mode, dev_id, j.dump());
+}
+
+int OrcaPrinterAgent::command_set_nozzle(std::string dev_id, int temp, int sequence_id, bool lan_mode)
+{
+    nlohmann::json j;
+    j["print"]["command"]        = "set_nozzle_temp";
+    j["print"]["sequence_id"]    = std::to_string(sequence_id);
+    j["print"]["extruder_index"] = 0;
+    j["print"]["target_temp"]    = temp;
+    return route_send(lan_mode, dev_id, j.dump());
+}
+
+int OrcaPrinterAgent::command_axis_control(std::string dev_id, std::string axis, double unit, double input_val,
+                                           int /*speed*/, bool is_core_xy, bool /*supports_mqtt_axis_control*/,
+                                           int sequence_id, bool lan_mode)
+{
+    std::transform(axis.begin(), axis.end(), axis.begin(), [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
+    if (axis != "X" && axis != "Y" && axis != "Z" && axis != "E") {
+        BOOST_LOG_TRIVIAL(warning) << "OrcaPrinterAgent: invalid axis control axis=" << axis;
+        return BAMBU_NETWORK_ERR_INVALID_HANDLE;
+    }
+
+    const double requested_distance = input_val * unit;
+    if (!std::isfinite(requested_distance) || requested_distance == 0.0) {
+        BOOST_LOG_TRIVIAL(warning) << "OrcaPrinterAgent: invalid axis control distance input=" << input_val
+                                   << " unit=" << unit;
+        return BAMBU_NETWORK_ERR_INVALID_HANDLE;
+    }
+
+    int direction = requested_distance > 0.0 ? 1 : -1;
+    if (!is_core_xy && (axis == "Y" || axis == "Z"))
+        direction = -direction;
+
+    nlohmann::json j;
+    j["print"]["command"]     = "xyz_ctrl";
+    j["print"]["sequence_id"] = std::to_string(sequence_id);
+    j["print"]["axis"]        = axis;
+    j["print"]["dir"]         = direction;
+    j["print"]["distance"]    = requested_distance < 0.0 ? -requested_distance : requested_distance;
+    return route_send(lan_mode, dev_id, j.dump());
+}
 
 bool OrcaPrinterAgent::parse_lan_endpoint(const std::string& dev_ip, std::string& host, std::string& port)
 {
@@ -418,6 +562,97 @@ std::string OrcaPrinterAgent::make_lan_client_id(const std::string& dev_id)
         return std::string(buf);
     }();
     return "orcaslicer-lan-" + dev_id + "-" + suffix;
+}
+
+bool OrcaPrinterAgent::parse_nonnegative_command_id(const std::string& value, int& result)
+{
+    if (value.empty())
+        return false;
+    try {
+        std::size_t consumed = 0;
+        const long long parsed = std::stoll(value, &consumed);
+        if (consumed != value.size() || parsed < 0 || parsed > std::numeric_limits<int>::max())
+            return false;
+        result = static_cast<int>(parsed);
+        return true;
+    } catch (const std::exception&) {
+        return false;
+    }
+}
+
+void OrcaPrinterAgent::parse_ipcam_info(const std::string& dev_id, const std::string& payload)
+{
+    const nlohmann::json envelope = nlohmann::json::parse(payload, nullptr, false);
+    if (!envelope.is_object())
+        return;
+
+    const auto print_it = envelope.find("print");
+    if (print_it == envelope.end() || !print_it->is_object())
+        return;
+
+    const nlohmann::json& print = *print_it;
+    const auto command_it = print.find("command");
+    const bool is_push_status = command_it != print.end() && command_it->is_string() && command_it->get<std::string>() == "push_status";
+    bool is_full_snapshot = false;
+    if (is_push_status) {
+        const auto msg_it = print.find("msg");
+        is_full_snapshot = msg_it == print.end() || (msg_it->is_number_integer() && msg_it->get<int>() == 0);
+    }
+
+    CameraStreamMode stream_mode = CameraStreamMode::none;
+    std::string stream_url;
+    bool has_camera_update = false;
+    const auto ipcam_it = print.find("ipcam");
+    if (ipcam_it != print.end() && ipcam_it->is_object()) {
+        const auto stream_modes_it = ipcam_it->find("stream_mode");
+        if (stream_modes_it != ipcam_it->end() && stream_modes_it->is_array()) {
+            has_camera_update = true;
+            for (const auto& stream : *stream_modes_it) {
+                if (!stream.is_object())
+                    continue;
+                const auto mode_it = stream.find("mode");
+                const auto url_it = stream.find("url");
+                if (mode_it == stream.end() || url_it == stream.end() || !mode_it->is_string() || !url_it->is_string())
+                    continue;
+
+                const std::string mode = mode_it->get<std::string>();
+                if (mode == "rtsp")
+                    stream_mode = CameraStreamMode::rtsp;
+                else if (mode == "http")
+                    stream_mode = CameraStreamMode::http;
+                else if (mode == "http_snapshot")
+                    stream_mode = CameraStreamMode::http_snapshot;
+                else
+                    continue;
+
+                stream_url = url_it->get<std::string>();
+                break; // OrcaSonar orders entries by preference.
+            }
+        }
+        else if (is_full_snapshot) {
+            has_camera_update = true;
+        }
+    } else if (is_full_snapshot) {
+        // A full push_status without ipcam means the printer has no camera
+        // stream information. Diff reports omit unchanged domains.
+        has_camera_update = true;
+    }
+
+    if (!has_camera_update)
+        return;
+
+    std::lock_guard<std::mutex> lock(state_mutex);
+    if (m_current_connection != LAN || m_lan_dev_id != dev_id) {
+        BOOST_LOG_TRIVIAL(info) << "Orca diagnostic: ignoring camera update for inactive LAN printer dev_id=" << dev_id;
+        return;
+    }
+
+    m_camera_stream_mode = stream_mode;
+    m_camera_url = std::move(stream_url);
+    BOOST_LOG_TRIVIAL(info) << "Orca diagnostic: updated camera state dev_id=" << dev_id
+                            << " transport=LAN"
+                            << " mode=" << static_cast<int>(m_camera_stream_mode)
+                            << " url=" << m_camera_url;
 }
 
 std::string OrcaPrinterAgent::lan_connection_target() const
@@ -493,14 +728,20 @@ int OrcaPrinterAgent::connect_printer(std::string dev_id, std::string dev_ip, st
                             << " client_id=" << cfg.client_id;
 
     OrcaMqttConnection* conn = nullptr;
+    CurrentConn previous_connection;
     {
         std::lock_guard<std::mutex> l(state_mutex);
+        previous_connection   = m_current_connection;
         m_lan_dev_id         = dev_id;
         m_lan_url            = cfg.url;
+        m_camera_stream_mode = CameraStreamMode::none;
+        m_camera_url.clear();
         m_current_connection = LAN;
         lan_mqtt_connection  = std::make_unique<OrcaMqttConnection>();
         conn                 = lan_mqtt_connection.get();
     }
+    BOOST_LOG_TRIVIAL(info) << "OrcaPrinterAgent: selected LAN printer dev_id=" << dev_id
+                            << " transport=" << connection_type_name(previous_connection) << "->LAN";
 
     if (m_lan_connect_thread.joinable())
         m_lan_connect_thread.join(); // disconnect_printer() above already stopped the old conn, so this is fast
@@ -561,17 +802,26 @@ int OrcaPrinterAgent::disconnect_printer()
     ++m_lan_generation; // fence stale worker callbacks
     std::unique_ptr<OrcaMqttConnection> doomed;
     std::string prev_dev;
+    CurrentConn previous_connection;
+    CurrentConn current_connection;
     {
         std::lock_guard<std::mutex> l(state_mutex);
+        previous_connection = m_current_connection;
         doomed   = std::move(lan_mqtt_connection);
         prev_dev = m_lan_dev_id;
         m_lan_dev_id.clear();
-        if (m_current_connection == LAN)
+        if (m_current_connection == LAN) {
             m_current_connection = NONE;
+            m_camera_stream_mode = CameraStreamMode::none;
+            m_camera_url.clear();
+        }
+        current_connection = m_current_connection;
     }
     BOOST_LOG_TRIVIAL(info) << "Orca diagnostic: LAN disconnect generation=" << m_lan_generation.load()
                             << " previous_dev_id=" << prev_dev << " had_connection=" << (doomed ? "yes" : "no")
-                            << " connected=" << (doomed && doomed->is_connected() ? "yes" : "no");
+                            << " connected=" << (doomed && doomed->is_connected() ? "yes" : "no")
+                            << " transport=" << connection_type_name(previous_connection) << "->"
+                            << connection_type_name(current_connection);
     // Tell the printer to stop pushing and drop the report topic before the socket
     // goes away (§3.2/§5.4: deselect issues pushing.stop on both transports).
     if (doomed && !prev_dev.empty() && doomed->is_connected()) {
@@ -591,14 +841,34 @@ int OrcaPrinterAgent::send_message_to_printer(std::string dev_id, std::string js
 
 int OrcaPrinterAgent::route_send(bool is_lan, const std::string& dev_id, const std::string& json_str)
 {
+    std::string command = "<unparsed>";
+    try {
+        const nlohmann::json envelope = nlohmann::json::parse(json_str);
+        for (const char* namespace_name : {"pushing", "info", "print", "system", "camera", "xcam", "upgrade", "event", "files"}) {
+            const auto namespace_it = envelope.find(namespace_name);
+            if (namespace_it != envelope.end() && namespace_it->is_object()) {
+                const auto command_it = namespace_it->find("command");
+                if (command_it != namespace_it->end() && command_it->is_string()) {
+                    command = std::string(namespace_name) + "." + command_it->get<std::string>();
+                    break;
+                }
+            }
+        }
+    } catch (const std::exception&) {
+        // Preserve the transport's existing behavior for malformed payloads;
+        // the printer will report the protocol error asynchronously.
+    }
     BOOST_LOG_TRIVIAL(info) << "OrcaPrinterAgent::route_send is_lan=" << is_lan << " dev_id=" << dev_id
-                            << " payload_bytes=" << json_str.size();
+                            << " command=" << command << " payload_bytes=" << json_str.size();
     if (dev_id.empty())
         return BAMBU_NETWORK_ERR_INVALID_HANDLE;
     OrcaMqttConnection* conn = get_appropriate_mqtt_connection(is_lan);
     if (!conn)
         return BAMBU_NETWORK_ERR_INVALID_HANDLE;
-    return conn->send_request(dev_id, json_str) ? BAMBU_NETWORK_SUCCESS : BAMBU_NETWORK_ERR_CONNECTION_TO_SERVER_FAILED;
+    const bool queued = conn->send_request(dev_id, json_str);
+    BOOST_LOG_TRIVIAL(info) << "OrcaPrinterAgent::route_send command=" << command << " queued=" << queued
+                            << " is_lan=" << is_lan << " dev_id=" << dev_id;
+    return queued ? BAMBU_NETWORK_SUCCESS : BAMBU_NETWORK_ERR_CONNECTION_TO_SERVER_FAILED;
 }
 
 // ============================================================================
@@ -706,17 +976,40 @@ int OrcaPrinterAgent::set_user_selected_machine(std::string dev_id)
 {
     auto* cloud = get_orca_cloud_agent();
     std::string previous;
+    CurrentConn previous_connection;
+    CurrentConn current_connection;
     {
         std::lock_guard<std::mutex> lock(state_mutex);
-        if (dev_id == selected_machine) {
-            BOOST_LOG_TRIVIAL(info) << "OrcaPrinterAgent::set_user_selected_machine: unchanged dev_id=" << dev_id;
+        previous_connection = m_current_connection;
+        // An empty cloud selection must not clear an independently active LAN
+        // selection. Conversely, selecting a cloud machine with the same id
+        // while LAN is active is still a transport switch and must proceed.
+        const bool same_selection = dev_id == selected_machine;
+        const bool same_transport  = dev_id.empty() ? m_current_connection != CLOUD : m_current_connection == CLOUD;
+        if (same_selection && same_transport) {
+            BOOST_LOG_TRIVIAL(info) << "OrcaPrinterAgent::set_user_selected_machine: unchanged dev_id=" << dev_id
+                                    << " transport=" << connection_type_name(m_current_connection);
             return BAMBU_NETWORK_SUCCESS;
         }
         previous         = selected_machine;
         selected_machine = dev_id;
+        if (dev_id.empty()) {
+            if (m_current_connection == CLOUD) {
+                m_current_connection = NONE;
+                m_camera_stream_mode = CameraStreamMode::none;
+                m_camera_url.clear();
+            }
+        } else {
+            m_current_connection = CLOUD;
+            m_camera_stream_mode = CameraStreamMode::none;
+            m_camera_url.clear();
+        }
+        current_connection = m_current_connection;
     }
     BOOST_LOG_TRIVIAL(info) << "OrcaPrinterAgent::set_user_selected_machine: previous=" << previous << " new=" << dev_id
-                            << " cloud=" << (cloud ? "set" : "<null>");
+                            << " cloud=" << (cloud ? "set" : "<null>") << " transport="
+                            << connection_type_name(previous_connection) << "->"
+                            << connection_type_name(current_connection);
     if (!cloud) {
         BOOST_LOG_TRIVIAL(warning) << "OrcaPrinterAgent::set_user_selected_machine: no Orca cloud agent";
         return BAMBU_NETWORK_SUCCESS;
@@ -731,11 +1024,6 @@ int OrcaPrinterAgent::set_user_selected_machine(std::string dev_id)
     if (!previous.empty() && conn && conn->is_connected())
         conn->send_request(previous, build_pushing_stop(seq(5)));
     cloud->teardown_selected_printer_mqtt();
-
-    {
-        std::lock_guard<std::mutex> lock(state_mutex);
-        m_current_connection = dev_id.empty() ? NONE : CLOUD;
-    }
 
     if (m_cloud_connect_thread.joinable())
         m_cloud_connect_thread.join(); // teardown_selected_printer_mqtt() above stopped the old cloud conn
@@ -843,6 +1131,22 @@ int OrcaPrinterAgent::set_queue_on_main_fn(QueueOnMainFn fn)
     std::lock_guard<std::mutex> lock(state_mutex);
     queue_on_main_fn = fn;
     return BAMBU_NETWORK_SUCCESS;
+}
+
+CameraStreamMode OrcaPrinterAgent::get_camera_stream_mode() const
+{
+    std::lock_guard<std::mutex> lock(state_mutex);
+    if (m_current_connection == CLOUD)
+        return CameraStreamMode::webrtc;
+    return m_camera_stream_mode;
+}
+
+std::string OrcaPrinterAgent::get_camera_url() const
+{
+    std::lock_guard<std::mutex> lock(state_mutex);
+    if (m_current_connection != LAN)
+        return {};
+    return m_camera_url;
 }
 
 } // namespace Slic3r
