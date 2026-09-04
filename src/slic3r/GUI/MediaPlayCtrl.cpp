@@ -290,7 +290,6 @@ void refresh_agora_url(char const* device, char const* dev_ver, char const* chan
 void MediaPlayCtrl::Play()
 {
     switch (current_mode()) {
-    case CameraStreamMode::http:
     case CameraStreamMode::http_snapshot:
         if (!m_next_retry.IsValid() || wxDateTime::Now() < m_next_retry)
             return;
@@ -300,14 +299,13 @@ void MediaPlayCtrl::Play()
             Stop(_L("Please confirm if the printer is connected."));
             return;
         }
-        if (auto agent = wxGetApp().getAgent())
-            agent->command_start_camera(m_machine);
         m_button_play->SetIcon("media_stop");
         m_web_ctrl->Load(wxURI(m_url), current_mode());
         m_web_ctrl->Play();
         m_last_state = wxMEDIASTATE_PLAYING;
         SetStatus(_L("Playing..."), false);
         return;
+    case CameraStreamMode::http:
     case CameraStreamMode::rtsp:
         if (m_next_retry.IsValid() && wxDateTime::Now() < m_next_retry)
             return;
@@ -769,7 +767,8 @@ void MediaPlayCtrl::load()
 {
     m_last_state = MEDIASTATE_LOADING;
     SetStatus(_L("Loading..."));
-    if (current_mode() != CameraStreamMode::rtsp) {
+    const auto mode = current_mode();
+    if (mode != CameraStreamMode::rtsp && mode != CameraStreamMode::http) {
         std::string file_h264 = data_dir() + "/video.h264";
         std::string file_info = data_dir() + "/video.info";
         BOOST_LOG_TRIVIAL(info) << "MediaPlayCtrl dump video to " << file_h264;
