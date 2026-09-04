@@ -728,6 +728,8 @@ set(SLIC3R_GUI_SOURCES
     Utils/ICameraSignalingChannel.hpp
     Utils/OrcaCloudServiceAgent.cpp
     Utils/OrcaCloudServiceAgent.hpp
+    Utils/OrcaMqttConnection.cpp
+    Utils/OrcaMqttConnection.hpp
     Utils/OrcaPrinterAgent.cpp
     Utils/OrcaPrinterAgent.hpp
     Utils/OrcaCloudSignalingChannel.cpp

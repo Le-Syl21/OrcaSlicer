@@ -250,14 +250,14 @@ void wxMediaCtrl3::bambu_log(void *ctx, int level, tchar const *msg2)
     BOOST_LOG_TRIVIAL(info) << msg.ToUTF8().data();
 }
 
-int wxMediaCtrl3::rtsp_interrupt_callback(void *opaque)
+int wxMediaCtrl3::ffmpeg_interrupt_callback(void *opaque)
 {
     auto *ctrl = static_cast<wxMediaCtrl3 *>(opaque);
     std::lock_guard<std::mutex> lock(ctrl->m_mutex);
     return ctrl->m_url != ctrl->m_active_url;
 }
 
-int wxMediaCtrl3::PlayRtsp(std::shared_ptr<wxURI> const &url, std::unique_lock<std::mutex> &lock)
+int wxMediaCtrl3::PlayFfmpeg(std::shared_ptr<wxURI> const &url, std::unique_lock<std::mutex> &lock)
 {
     if (avformat_network_init() < 0)
         return 2;
@@ -268,7 +268,9 @@ int wxMediaCtrl3::PlayRtsp(std::shared_ptr<wxURI> const &url, std::unique_lock<s
         return 2;
     }
 
-    format_context->interrupt_callback = {&wxMediaCtrl3::rtsp_interrupt_callback, this};
+    format_context->interrupt_callback = {&wxMediaCtrl3::ffmpeg_interrupt_callback, this};
+    format_context->flags |= AVFMT_FLAG_NOBUFFER;
+    format_context->max_delay = 0;
     m_active_url = url;
 
     auto finish = [&](int error) {
@@ -281,8 +283,20 @@ int wxMediaCtrl3::PlayRtsp(std::shared_ptr<wxURI> const &url, std::unique_lock<s
     };
 
     const std::string uri = url->BuildURI().ToUTF8().data();
+    const wxString scheme = url->GetScheme();
+    const bool http_stream = scheme.CmpNoCase("http") == 0 || scheme.CmpNoCase("https") == 0;
     AVDictionary *options = nullptr;
-    av_dict_set(&options, "rtsp_transport", "tcp", 0);
+    if (http_stream) {
+        // This is a live multipart MJPEG stream. Keep FFmpeg from building a
+        // read-ahead buffer, otherwise the UI can display frames several
+        // seconds behind the camera.
+        av_dict_set(&options, "fflags", "nobuffer", 0);
+        av_dict_set(&options, "avioflags", "direct", 0);
+        av_dict_set(&options, "probesize", "32", 0);
+        av_dict_set(&options, "analyzeduration", "0", 0);
+    } else {
+        av_dict_set(&options, "rtsp_transport", "tcp", 0);
+    }
     lock.unlock();
     int error = avformat_open_input(&format_context, uri.c_str(), nullptr, &options);
     av_dict_free(&options);
@@ -340,7 +354,12 @@ int wxMediaCtrl3::PlayRtsp(std::shared_ptr<wxURI> const &url, std::unique_lock<s
                     break;
                 if (frame.IsOk())
                     m_frame = frame;
-                CallAfter([this] { Refresh(); });
+                if (!m_refresh_pending.exchange(true)) {
+                    CallAfter([this] {
+                        m_refresh_pending.store(false);
+                        Refresh();
+                    });
+                }
             }
         }
         av_packet_unref(packet);
@@ -363,10 +382,11 @@ void wxMediaCtrl3::PlayThread()
         if (!url->HasScheme())
             break;
         const wxString scheme = url->GetScheme();
-        const bool generic_rtsp = scheme.CmpNoCase("rtsp") == 0 || scheme.CmpNoCase("rtsps") == 0;
+        const bool generic_ffmpeg = scheme.CmpNoCase("http") == 0 || scheme.CmpNoCase("https") == 0 ||
+                                    scheme.CmpNoCase("rtsp") == 0 || scheme.CmpNoCase("rtsps") == 0;
         int error = 0;
-        if (generic_rtsp) {
-            error = PlayRtsp(url, lk);
+        if (generic_ffmpeg) {
+            error = PlayFfmpeg(url, lk);
         } else {
             lk.unlock();
             Bambu_Tunnel tunnel = nullptr;

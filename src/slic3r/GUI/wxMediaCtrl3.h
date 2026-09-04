@@ -16,6 +16,7 @@ wxDECLARE_EVENT(EVT_MEDIA_CTRL_STAT, wxCommandEvent);
 void wxMediaCtrl_OnSize(wxWindow * ctrl, wxSize const & videoSize, int width, int height);
 
 #define BAMBU_DYNAMIC
+#include <atomic>
 #include <condition_variable>
 #include <thread>
 #include <wx/image.h>
@@ -64,10 +65,10 @@ protected:
     void DoSetSize(int x, int y, int width, int height, int sizeFlags) override;
 
     static void bambu_log(void *ctx, int level, tchar const *msg);
-    static int rtsp_interrupt_callback(void *opaque);
+    static int ffmpeg_interrupt_callback(void *opaque);
 
     void PlayThread();
-    int PlayRtsp(std::shared_ptr<wxURI> const &url, std::unique_lock<std::mutex> &lock);
+    int PlayFfmpeg(std::shared_ptr<wxURI> const &url, std::unique_lock<std::mutex> &lock);
 
     void NotifyStopped();
 
@@ -92,6 +93,7 @@ private:
     std::mutex m_mutex;
     std::condition_variable m_cond;
     std::thread m_thread;
+    std::atomic_bool m_refresh_pending{false};
 };
 
 #endif /* wxMediaCtrl3_h */

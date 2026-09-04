@@ -24,84 +24,14 @@
 #include <vector>
 #include <nlohmann/json.hpp>
 
+#include "OrcaMqttConnection.hpp"
+
 class wxSecretStore;
 
 namespace Slic3r {
 
 // Forward declarations
 class AppConfig;
-// MQTT 3.1.1 over the aggregate WebSocket is deliberately kept here instead
-// of using the printer SDK. The endpoint is a read-only status stream; MQTT
-// PUBLISH must never be sent on it because the cloud closes such sessions.
-class OrcaCloudMqttConnection
-{
-public:
-    using TokenProvider  = std::function<std::string()>;
-    using MessageHandler = std::function<void(const std::string&, const std::string&)>;
-    using StateHandler   = std::function<void(bool connected, bool initial)>;
-
-    ~OrcaCloudMqttConnection();
-
-    bool start(const std::string& endpoint, TokenProvider token_provider, MessageHandler message_handler, StateHandler state_handler);
-    void stop();
-    // True while the worker thread is alive (connected OR retrying). Lets callers
-    // avoid restarting a healthy connection.
-    bool is_running() const;
-    // True once CONNACK has been received and the socket has not since dropped.
-    bool is_connected() const { return connected.load(); }
-    bool subscribe(const std::vector<std::string>& device_ids);
-    bool unsubscribe(const std::vector<std::string>& device_ids);
-    void clear_subscriptions();
-
-private:
-    struct Endpoint { std::string host; std::string port; std::string target; };
-    using WebSocket = boost::beast::websocket::stream<
-        boost::asio::ssl::stream<boost::beast::tcp_stream>>;
-    struct Connection;
-
-    static bool parse_endpoint(const std::string& url, Endpoint& endpoint);
-    static void append_string(std::vector<uint8_t>& packet, const std::string& value);
-    static void prepend_remaining_length(std::vector<uint8_t>& packet, size_t length);
-    static std::vector<uint8_t> make_connect_packet();
-    static std::string report_topic(const std::string& device_id);
-    static std::vector<uint8_t> make_topic_packet(uint8_t type, uint16_t packet_id, const std::vector<std::string>& device_ids);
-    static std::vector<uint8_t> make_ping_packet();
-
-    void send(WebSocket& websocket, const std::vector<uint8_t>& packet);
-    // Emit a queued SUBSCRIBE/UNSUBSCRIBE on the live socket right now (from the
-    // caller thread), so a selection change is applied without waiting for the
-    // blocking read loop to next return. No-op if no CONNACKed socket exists yet
-    // (the worker sends the set on connect). The aggregate viewer is dynamic — the
-    // WebSocket is never dropped for a subscription change.
-    void flush_subscription_change();
-    void connect_and_read();
-    void send_current_subscriptions(WebSocket& websocket);
-    void send_pending_subscriptions(WebSocket& websocket);
-    void handle_packet(const std::string& packet);
-    void notify_state(bool is_now_connected);
-    void run();
-
-    std::atomic_bool stopping{true};
-    std::atomic_int reconnect_delay_seconds{1};
-    std::thread worker;
-    std::mutex mutex;
-    std::mutex connection_mutex;
-    std::mutex write_mutex; // serialises every websocket write (worker + caller threads)
-    std::shared_ptr<Connection> active_connection;
-    std::condition_variable initial_cv;
-    std::condition_variable state_cv;
-    std::string endpoint_url;
-    TokenProvider get_token;
-    MessageHandler on_message;
-    StateHandler on_state;
-    std::set<std::string> subscriptions;
-    std::set<std::string> pending_subscriptions;
-    std::set<std::string> pending_unsubscriptions;
-    std::atomic<uint16_t> next_packet_id{1};
-    bool initial_result{false};
-    bool initial_completed{false};
-    std::atomic_bool connected{false};
-};
 struct BundleMetadata;
 struct PluginDescriptor;
 struct PluginChangelog;
@@ -288,10 +218,10 @@ public:
     int del_subscribe(std::vector<std::string> dev_list) override;
     void enable_multi_machine(bool enable) override;
 
-    // The aggregate printer socket is status-only. OrcaPrinterAgent registers
-    // its normal message callback here and adds/removes device report topics
-    // through add_subscribe()/del_subscribe(). Printer commands continue to
-    // use the REST commands endpoint; they must never be published here.
+    // The per-printer MQTT socket carries both directions: inbound reports from
+    // device/<id>/report and commands PUBLISHed to device/<id>/request on this
+    // socket. OrcaPrinterAgent registers its message callback here to receive the
+    // inbound half; pass an empty fn to clear it before the agent is destroyed.
     int set_printer_status_callback(OnMessageFn fn);
 
     // Send a Bambu-dialect command to one printer via the cloud relay's REST
@@ -439,7 +369,26 @@ public:
 
     static std::string generate_uuid_for_setting_id(const std::string& name, const std::string& user_id = "");
 
+    OrcaMqttConnection* get_mqtt_connection() noexcept {
+        return mqtt_connection.get();
+    }
+
+    const OrcaMqttConnection* get_mqtt_connection() const noexcept {
+        return mqtt_connection.get();
+    }
+
+    // Per-printer cloud socket: wss://<api_base_url>/api/v1/printers/<dev_id>/mqtt.
+    // configure_ blocks for the duration of the initial connect attempt, so callers
+    // drive it off the UI thread; teardown_ is synchronous.
+    int         configure_selected_printer_mqtt(const std::string& dev_id);
+    void        teardown_selected_printer_mqtt();
+    // Test hook: the wss:// URL of the current per-printer socket ("" when none).
+    std::string selected_printer_mqtt_url() const;
+
 private:
+    // Fans one inbound per-printer MQTT message out to printer_status_callback.
+    void deliver_cloud_message(const std::string& dev_id, const std::string& payload);
+
     // Sync protocol helpers
     int sync_pull(
         std::function<void(const SyncPullResponse&)> on_success,
@@ -516,7 +465,9 @@ private:
                                std::chrono::system_clock::now().time_since_epoch()).count()};
 
     // Member variables - connection state
-    std::unique_ptr<OrcaCloudMqttConnection> mqtt_connection;
+    std::unique_ptr<OrcaMqttConnection> mqtt_connection;
+    std::string        m_selected_printer_mqtt_url;   // guarded by m_selected_url_mutex
+    mutable std::mutex m_selected_url_mutex;
     bool is_connected{false};
     bool enable_track{false};
     bool multi_machine_enabled{false};

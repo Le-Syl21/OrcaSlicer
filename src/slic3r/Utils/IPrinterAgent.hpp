@@ -247,7 +247,7 @@ public:
     virtual std::string get_user_selected_machine() = 0;
 
     /**
-     * Update the selected machine preference.
+     * Update the selected cloud machine preference.
      */
     virtual int set_user_selected_machine(std::string dev_id) = 0;
 
