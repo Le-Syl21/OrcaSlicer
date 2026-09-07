@@ -372,6 +372,8 @@ wxString MachineObject::get_printer_type_display_str() const
     std::string display_name = DevPrinterConfigUtil::get_printer_display_name(printer_type);
     if (!display_name.empty())
         return display_name;
+    else if (printer_type == "orcasonar")
+        return "OrcaSonar Printer";
     else
         return _L("Unknown");
 }
