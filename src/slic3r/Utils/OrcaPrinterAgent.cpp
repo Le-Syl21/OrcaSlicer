@@ -1,13 +1,19 @@
 #include "OrcaPrinterAgent.hpp"
+#include "Http.hpp"
 #include "IPrinterAgent.hpp"
 #include "NetworkAgentFactory.hpp"
 #include "OrcaCloudServiceAgent.hpp"
+#include "bambu_networking.hpp"
 #include <algorithm>
+#include <atomic>
+#include <boost/algorithm/string.hpp>
 #include <boost/asio.hpp>
+#include <boost/filesystem.hpp>
 #include <boost/log/trivial.hpp>
 #include <array>
 #include <chrono>
 #include <cctype>
+#include <cstdint>
 #include <cstdio>
 #include <condition_variable>
 #include <cmath>
@@ -23,6 +29,147 @@
 namespace Slic3r {
 
 const std::string OrcaPrinterAgent_VERSION = "0.0.1";
+
+namespace {
+
+namespace fs = boost::filesystem;
+
+// params.filename is normally the exported .3mf archive; the sliced G-code sits
+// beside it with the same stem (".12345.0.3mf" -> ".12345.0.gcode"). params.dst_file,
+// when set, already points straight at a file (the "print a file already on the
+// card" flow), so it wins.
+std::string resolve_local_gcode_path(const PrintParams& params)
+{
+    if (!params.dst_file.empty())
+        return params.dst_file;
+
+    std::string path = params.filename;
+    if (boost::iends_with(path, ".3mf"))
+        path.replace(path.size() - 4, 4, ".gcode");
+    return path;
+}
+
+// The name the file is stored as under the printer's `gcodes` root, and the value
+// passed to OrcaSonar's print.gcode_file `param`. Must be a pure function of params
+// so start_local_print's upload and start_sdcard_print's start agree on it.
+// OrcaSonar rejects newlines, ';', '#', '*' and NUL in the path, and Klipper's
+// SDCARD_PRINT_FILE splits its argument on whitespace, so collapse anything unsafe.
+std::string remote_gcode_name(const PrintParams& params)
+{
+    std::string name = params.project_name.empty()
+                           ? fs::path(resolve_local_gcode_path(params)).filename().string()
+                           : fs::path(params.project_name).filename().string();
+
+    if (boost::iends_with(name, ".3mf")) // "model.gcode.3mf" -> "model.gcode"
+        name.erase(name.size() - 4);
+
+    std::replace_if(
+        name.begin(), name.end(),
+        [](unsigned char c) {
+            return std::isspace(c) != 0 || c == ';' || c == '#' || c == '*' || c == '/' || c == '\\';
+        },
+        '_');
+
+    if (name.empty())
+        name = "orca_print";
+    if (!boost::iends_with(name, ".gcode"))
+        name += ".gcode";
+    return name;
+}
+
+// http(s) origin of the Moonraker-compatible upload facade, derived from the live
+// LAN MQTT session URL ("ws://host:port/mqtt" -> "http://host:port"). Used only as
+// a fallback when the print job carries no dev_ip of its own.
+std::string http_origin_from_lan_ws(const std::string& ws_url)
+{
+    if (ws_url.empty())
+        return {};
+    std::string s = ws_url;
+    if (boost::istarts_with(s, "wss://"))
+        s = "https://" + s.substr(6);
+    else if (boost::istarts_with(s, "ws://"))
+        s = "http://" + s.substr(5);
+    const auto scheme = s.find("://");
+    if (scheme != std::string::npos) {
+        if (const auto slash = s.find('/', scheme + 3); slash != std::string::npos)
+            s.erase(slash);
+    }
+    return s;
+}
+
+// print.gcode_file is non-idempotent and OrcaSonar replays a cached response for a
+// reused (namespace, command, sequence_id). Seed from the wall clock so ids do not
+// collide across slicer restarts, then bump once per call within a run.
+std::string next_gcode_file_sequence_id()
+{
+    static std::atomic<uint64_t> counter{[] {
+        const auto now = std::chrono::system_clock::now().time_since_epoch();
+        return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::seconds>(now).count());
+    }()};
+    return std::to_string(counter.fetch_add(1, std::memory_order_relaxed));
+}
+
+// Ask an OrcaSonar instance at host:port for its MQTT device id. Every command
+// topic is keyed on it (device/<id>/request), so a manual "connect by IP" has to
+// learn it from the printer instead of inventing one from the address. OrcaSonar's
+// landing page (GET /) returns "OrcaSonar running\ndevice_id=<id>\nmqtt=<addr>\n";
+// /upnp/device.xml carries the same id as <UDN>uuid:<id></UDN> and is the fallback.
+bool probe_orcasonar_device_id(const std::string& host, const std::string& port, std::string& device_id)
+{
+    const std::string origin = "http://" + host + ":" + port;
+
+    auto fetch = [](const std::string& url, std::string& body) {
+        bool ok = false;
+        Http::get(url)
+            .timeout_connect(4)
+            .timeout_max(6)
+            .on_complete([&](std::string b, unsigned status) {
+                if (status == 200) {
+                    body = std::move(b);
+                    ok   = true;
+                }
+            })
+            .on_error([&](std::string, std::string err, unsigned status) {
+                BOOST_LOG_TRIVIAL(info) << "OrcaPrinterAgent: identity probe " << url
+                                        << " failed status=" << status << " err=" << err;
+            })
+            .perform_sync();
+        return ok;
+    };
+
+    auto extract = [](const std::string& body, const std::string& start_token, char end_char) -> std::string {
+        const auto pos = body.find(start_token);
+        if (pos == std::string::npos)
+            return {};
+        const auto value_start = pos + start_token.size();
+        const auto value_end   = body.find(end_char, value_start);
+        std::string value      = body.substr(value_start, value_end == std::string::npos ? std::string::npos : value_end - value_start);
+        boost::trim(value);
+        return value;
+    };
+
+    std::string body;
+    if (fetch(origin + "/", body)) {
+        std::string id = extract(body, "device_id=", '\n');
+        if (!id.empty()) {
+            device_id = std::move(id);
+            return true;
+        }
+    }
+
+    body.clear();
+    if (fetch(origin + "/upnp/device.xml", body)) {
+        std::string id = extract(body, "uuid:", '<');
+        if (!id.empty()) {
+            device_id = std::move(id);
+            return true;
+        }
+    }
+
+    return false;
+}
+
+} // namespace
 
 class OrcaPrinterAgent::OrcaSonarDiscovery
 {
@@ -921,12 +1068,41 @@ bool OrcaPrinterAgent::start_discovery(bool start, bool /*sending*/)
 }
 
 // ============================================================================
-// Binding - All Stubs
+// Binding
 // ============================================================================
 
 int OrcaPrinterAgent::ping_bind(std::string ping_code) { return BAMBU_NETWORK_SUCCESS; }
 
-int OrcaPrinterAgent::bind_detect(std::string dev_ip, std::string sec_link, detectResult& detect) { return BAMBU_NETWORK_SUCCESS; }
+// Runs on the "Input IP address" dialog worker thread, before any MachineObject
+// exists. Probe the address for a live OrcaSonar and hand its real device id back
+// so DeviceManager::insert_local_device keys the machine correctly; connect_type
+// and bind_state must be set for is_lan_mode_printer()/is_avaliable() to hold, or
+// set_selected_machine never routes to the LAN connect path.
+int OrcaPrinterAgent::bind_detect(std::string dev_ip, std::string /*sec_link*/, detectResult& detect)
+{
+    std::string host, port;
+    if (!parse_lan_endpoint(dev_ip, host, port)) {
+        BOOST_LOG_TRIVIAL(warning) << "OrcaPrinterAgent::bind_detect: unparsable dev_ip=" << dev_ip;
+        return BAMBU_NETWORK_ERR_INVALID_HANDLE; // -1: dialog shows "Failed to connect to printer."
+    }
+
+    std::string device_id;
+    if (!probe_orcasonar_device_id(host, port, device_id) || device_id.empty()) {
+        BOOST_LOG_TRIVIAL(warning) << "OrcaPrinterAgent::bind_detect: no OrcaSonar reachable at " << host << ":" << port;
+        return BAMBU_NETWORK_ERR_INVALID_HANDLE;
+    }
+
+    detect.dev_id       = device_id;
+    detect.dev_name     = device_id;
+    detect.model_id     = ""; // unknown; DeviceManager::insert_local_device defaults it
+    detect.version      = "";
+    detect.connect_type = "lan";  // required by MachineObject::is_lan_mode_printer()
+    detect.bind_state   = "free"; // required by MachineObject::is_avaliable()
+    detect.result_msg   = "";
+    BOOST_LOG_TRIVIAL(info) << "OrcaPrinterAgent::bind_detect: found OrcaSonar dev_id=" << device_id
+                            << " at " << host << ":" << port;
+    return BAMBU_NETWORK_SUCCESS;
+}
 
 int OrcaPrinterAgent::bind(std::string dev_ip,
                            std::string dev_id,
@@ -1061,14 +1237,155 @@ int OrcaPrinterAgent::start_local_print_with_record(PrintParams params,
                                                     OnWaitFn wait_fn)
 { return BAMBU_NETWORK_SUCCESS; }
 
-int OrcaPrinterAgent::start_send_gcode_to_sdcard(PrintParams params, OnUpdateStatusFn update_fn, WasCancelledFn cancel_fn, OnWaitFn wait_fn)
-{ return BAMBU_NETWORK_SUCCESS; }
+// Upload one G-code file to the printer's `gcodes` root over OrcaSonar's
+// Moonraker-compatible HTTP facade. No print is started here (print=false); the
+// caller issues print.gcode_file over MQTT separately (start_sdcard_print).
+int OrcaPrinterAgent::start_send_gcode_to_sdcard(PrintParams params, OnUpdateStatusFn update_fn, WasCancelledFn cancel_fn, OnWaitFn /*wait_fn*/)
+{
+    if (update_fn)
+        update_fn(PrintingStageCreate, 0, "Preparing...");
 
+    const std::string local_path = resolve_local_gcode_path(params);
+    const fs::path    source(local_path);
+    boost::system::error_code ec;
+    if (!fs::exists(source, ec) || !fs::is_regular_file(source, ec)) {
+        BOOST_LOG_TRIVIAL(error) << "OrcaPrinterAgent: G-code file does not exist: " << local_path;
+        return BAMBU_NETWORK_ERR_FILE_NOT_EXIST;
+    }
+
+    const std::uintmax_t file_size = fs::file_size(source, ec);
+    if (ec) {
+        BOOST_LOG_TRIVIAL(error) << "OrcaPrinterAgent: cannot stat G-code file " << local_path << ": " << ec.message();
+        return BAMBU_NETWORK_ERR_PRINT_SG_UPLOAD_FTP_FAILED;
+    }
+    if (file_size > 1024ull * 1024 * 1024) { // OrcaSonar caps a single upload at 1 GiB
+        BOOST_LOG_TRIVIAL(error) << "OrcaPrinterAgent: G-code file too large: " << file_size << " bytes";
+        return BAMBU_NETWORK_ERR_PRINT_SG_UPLOAD_FTP_FAILED;
+    }
+
+    std::string host, port, origin;
+    if (parse_lan_endpoint(params.dev_ip, host, port))
+        origin = "http://" + host + ":" + port;
+    else
+        origin = http_origin_from_lan_ws(lan_connection_target());
+    if (origin.empty()) {
+        BOOST_LOG_TRIVIAL(warning) << "OrcaPrinterAgent: no LAN HTTP endpoint for G-code upload (dev_ip=" << params.dev_ip << ")";
+        return BAMBU_NETWORK_ERR_INVALID_HANDLE;
+    }
+
+    const std::string upload_name = remote_gcode_name(params);
+    BOOST_LOG_TRIVIAL(info) << "OrcaPrinterAgent: uploading G-code " << local_path << " -> " << origin
+                            << "/server/files/upload as " << upload_name << " (" << file_size << " bytes)";
+
+    if (update_fn)
+        update_fn(PrintingStageUpload, 0, "Uploading...");
+
+    bool        canceled = false;
+    long        http_status = 0;
+    std::string http_error;
+    std::string response_body;
+
+    auto http = Http::post(origin + "/server/files/upload");
+    if (!params.password.empty())
+        http.header("X-Api-Key", params.password); // trusted LAN facades may not require it; harmless when they do not
+    http.form_add("root", "gcodes")
+        .form_add("print", "false")
+        .form_add_file("file", source, upload_name)
+        .timeout_connect(5)
+        .timeout_max(300) // large G-code over a slow link
+        .on_complete([&](std::string body, unsigned status) {
+            http_status   = status;
+            response_body = std::move(body);
+        })
+        .on_error([&](std::string body, std::string err, unsigned status) {
+            http_status   = status;
+            http_error    = std::move(err);
+            response_body = std::move(body);
+        })
+        .on_progress([&](Http::Progress progress, bool& cancel) {
+            if (cancel_fn && cancel_fn()) {
+                cancel   = true;
+                canceled = true;
+                return;
+            }
+            if (update_fn && progress.ultotal > 0) {
+                const int percent = static_cast<int>((progress.ulnow * 100) / progress.ultotal);
+                update_fn(PrintingStageUpload, percent, "Uploading...");
+            }
+        })
+        .perform_sync();
+
+    if (canceled) {
+        BOOST_LOG_TRIVIAL(info) << "OrcaPrinterAgent: G-code upload canceled by user";
+        return BAMBU_NETWORK_ERR_CANCELED;
+    }
+
+    // OrcaSonar's Moonraker facade returns 201 Created on a successful save.
+    if (http_status != 200 && http_status != 201) {
+        BOOST_LOG_TRIVIAL(warning) << "OrcaPrinterAgent: G-code upload failed http_status=" << http_status
+                                   << " error=" << http_error << " body=" << response_body;
+        return BAMBU_NETWORK_ERR_PRINT_SG_UPLOAD_FTP_FAILED;
+    }
+
+    if (update_fn)
+        update_fn(PrintingStageUpload, 100, "File uploaded");
+    return BAMBU_NETWORK_SUCCESS;
+}
+
+// Upload the sliced G-code, then start it: the LAN "print now" path.
 int OrcaPrinterAgent::start_local_print(PrintParams params, OnUpdateStatusFn update_fn, WasCancelledFn cancel_fn)
-{ return BAMBU_NETWORK_SUCCESS; }
+{
+    if (cancel_fn && cancel_fn())
+        return BAMBU_NETWORK_ERR_CANCELED;
 
+    const int upload_rc = start_send_gcode_to_sdcard(params, update_fn, cancel_fn, nullptr);
+    if (upload_rc != BAMBU_NETWORK_SUCCESS)
+        return upload_rc;
+
+    if (cancel_fn && cancel_fn())
+        return BAMBU_NETWORK_ERR_CANCELED;
+
+    return start_sdcard_print(params, update_fn, cancel_fn);
+}
+
+// Start a file that already lives on the printer by publishing the canonical
+// OPCP print.gcode_file command to device/<dev_id>/request. The acknowledgement
+// and lifecycle progress arrive asynchronously as print.push_status on the
+// report topic, which the GUI already consumes.
 int OrcaPrinterAgent::start_sdcard_print(PrintParams params, OnUpdateStatusFn update_fn, WasCancelledFn cancel_fn)
-{ return BAMBU_NETWORK_SUCCESS; }
+{
+    if (params.dev_id.empty()) {
+        BOOST_LOG_TRIVIAL(warning) << "OrcaPrinterAgent: start_sdcard_print rejected missing dev_id";
+        return BAMBU_NETWORK_ERR_INVALID_HANDLE;
+    }
+    if (cancel_fn && cancel_fn())
+        return BAMBU_NETWORK_ERR_CANCELED;
+
+    // dst_file, when set, names a file already on the printer (print-from-SD flow);
+    // otherwise start what start_send_gcode_to_sdcard just uploaded to `gcodes`.
+    const std::string target = params.dst_file.empty() ? remote_gcode_name(params)
+                                                       : fs::path(params.dst_file).filename().string();
+
+    nlohmann::json j;
+    j["print"]["command"]     = "gcode_file";
+    j["print"]["sequence_id"] = next_gcode_file_sequence_id();
+    j["print"]["param"]       = target;
+
+    if (update_fn)
+        update_fn(PrintingStageSending, 0, "Starting print...");
+
+    const bool is_lan = params.connection_type == "lan";
+    const int  rc     = route_send(is_lan, params.dev_id, j.dump());
+    if (rc != BAMBU_NETWORK_SUCCESS) {
+        BOOST_LOG_TRIVIAL(warning) << "OrcaPrinterAgent: start_sdcard_print publish failed rc=" << rc
+                                   << " dev_id=" << params.dev_id << " param=" << target;
+        return BAMBU_NETWORK_ERR_PRINT_LP_PUBLISH_MSG_FAILED;
+    }
+
+    if (update_fn)
+        update_fn(PrintingStageFinished, 100, "Print started");
+    return BAMBU_NETWORK_SUCCESS;
+}
 
 // ============================================================================
 // Callback Registration
