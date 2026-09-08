@@ -1040,6 +1040,14 @@ std::string NetworkAgent::get_local_camera_stream_url() const
     return {};
 }
 
+std::unique_ptr<ICameraSignalingChannel>
+NetworkAgent::create_camera_signaling_channel(const std::string& dev_id)
+{
+    if (m_printer_agent)
+        return m_printer_agent->create_camera_signaling_channel(dev_id);
+    return nullptr;
+}
+
 int NetworkAgent::request_bind_ticket(std::string* ticket)
 {
     if (m_printer_agent)

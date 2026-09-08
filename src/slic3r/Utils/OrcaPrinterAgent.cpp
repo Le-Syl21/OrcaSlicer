@@ -1,4 +1,5 @@
 #include "OrcaPrinterAgent.hpp"
+#include "OrcaCloudSignalingChannel.hpp"
 #include "Http.hpp"
 #include "IPrinterAgent.hpp"
 #include "NetworkAgentFactory.hpp"
@@ -636,6 +637,15 @@ void OrcaPrinterAgent::set_cloud_agent(std::shared_ptr<ICloudServiceAgent> cloud
     const int callback_result = get_orca_cloud_agent()->set_printer_status_callback(
         [this](std::string dev_id, std::string payload) { deliver_to_sink(dev_id, payload); });
     BOOST_LOG_TRIVIAL(info) << "OrcaPrinterAgent::set_cloud_agent: status callback result=" << callback_result;
+}
+
+std::unique_ptr<ICameraSignalingChannel>
+OrcaPrinterAgent::create_camera_signaling_channel(const std::string& dev_id)
+{
+    std::lock_guard<std::mutex> lock(state_mutex);
+    if (!m_cloud_agent)
+        return nullptr;
+    return std::make_unique<OrcaCloudSignalingChannel>(m_cloud_agent, dev_id);
 }
 
 // ============================================================================

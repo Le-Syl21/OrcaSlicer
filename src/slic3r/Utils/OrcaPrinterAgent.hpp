@@ -34,6 +34,10 @@ public:
     // ========================================================================
 
     void set_cloud_agent(std::shared_ptr<ICloudServiceAgent> cloud) override;
+    CameraStreamMode get_camera_stream_mode() const override;
+    std::string get_camera_url() const override;
+    std::unique_ptr<ICameraSignalingChannel>
+    create_camera_signaling_channel(const std::string& dev_id) override;
 
     // Communication
     int send_message(std::string dev_id, std::string json_str, int qos, int flag) override;
@@ -62,9 +66,6 @@ public:
     int request_bind_ticket(std::string* ticket) override;
     int get_hms_snapshot(std::string dev_id, std::string file_name, std::function<void(std::string, int)> callback) override;
     int set_server_callback(OnServerErrFn fn) override;
-
-    CameraStreamMode get_camera_stream_mode() const override;
-    std::string get_camera_url() const override;
 
     // Machine Selection
     std::string get_user_selected_machine() override;

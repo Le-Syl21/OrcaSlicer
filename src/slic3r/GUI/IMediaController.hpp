@@ -3,6 +3,8 @@
 #include <wx/mediactrl.h>
 #include <wx/uri.h>
 
+#include <memory>
+
 #include <slic3r/Utils/IPrinterAgent.hpp>
 
 namespace Slic3r { namespace GUI {
@@ -10,6 +12,8 @@ namespace Slic3r { namespace GUI {
 class IMediaController
 {
 public:
+    virtual ~IMediaController() = default;
+
     virtual void Load(wxURI url) = 0;
 
     // The default keeps existing media controllers unaware of camera-specific modes.
@@ -28,6 +32,13 @@ public:
     virtual int GetLastError() const { return {}; };
 
     virtual wxSize GetVideoSize() const { return {}; };
+
+    virtual void StartSession(std::unique_ptr<ICameraSignalingChannel> channel)
+    {
+        (void) channel;
+    }
+
+    virtual void StopSession() {}
 
 private:
 };
