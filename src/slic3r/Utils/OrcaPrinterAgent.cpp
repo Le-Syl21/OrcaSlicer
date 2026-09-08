@@ -22,9 +22,13 @@
 #include <nlohmann/json.hpp>
 #include <random>
 #include <set>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <utility>
+
+#include <boost/property_tree/ptree.hpp>
+#include <boost/property_tree/xml_parser.hpp>
 
 namespace Slic3r {
 
@@ -56,19 +60,15 @@ std::string resolve_local_gcode_path(const PrintParams& params)
 // SDCARD_PRINT_FILE splits its argument on whitespace, so collapse anything unsafe.
 std::string remote_gcode_name(const PrintParams& params)
 {
-    std::string name = params.project_name.empty()
-                           ? fs::path(resolve_local_gcode_path(params)).filename().string()
-                           : fs::path(params.project_name).filename().string();
+    std::string name = params.project_name.empty() ? fs::path(resolve_local_gcode_path(params)).filename().string() :
+                                                     fs::path(params.project_name).filename().string();
 
     if (boost::iends_with(name, ".3mf")) // "model.gcode.3mf" -> "model.gcode"
         name.erase(name.size() - 4);
 
     std::replace_if(
         name.begin(), name.end(),
-        [](unsigned char c) {
-            return std::isspace(c) != 0 || c == ';' || c == '#' || c == '*' || c == '/' || c == '\\';
-        },
-        '_');
+        [](unsigned char c) { return std::isspace(c) != 0 || c == ';' || c == '#' || c == '*' || c == '/' || c == '\\'; }, '_');
 
     if (name.empty())
         name = "orca_print";
@@ -109,64 +109,152 @@ std::string next_gcode_file_sequence_id()
     return std::to_string(counter.fetch_add(1, std::memory_order_relaxed));
 }
 
-// Ask an OrcaSonar instance at host:port for its MQTT device id. Every command
-// topic is keyed on it (device/<id>/request), so a manual "connect by IP" has to
-// learn it from the printer instead of inventing one from the address. OrcaSonar's
-// landing page (GET /) returns "OrcaSonar running\ndevice_id=<id>\nmqtt=<addr>\n";
-// /upnp/device.xml carries the same id as <UDN>uuid:<id></UDN> and is the fallback.
-bool probe_orcasonar_device_id(const std::string& host, const std::string& port, std::string& device_id)
+static constexpr const char* ORCASONAR_FALLBACK = "orcasonar";
+
+bool fetch_orcasonar_body(const std::string& url, std::string& body)
 {
-    const std::string origin = "http://" + host + ":" + port;
+    bool ok = false;
+    Http::get(url)
+        .timeout_connect(4)
+        .timeout_max(6)
+        .on_complete([&](std::string b, unsigned status) {
+            if (status == 200) {
+                body = std::move(b);
+                ok   = true;
+            }
+        })
+        .on_error([&](std::string, std::string err, unsigned status) {
+            BOOST_LOG_TRIVIAL(info) << "OrcaPrinterAgent: identity probe " << url << " failed status=" << status << " err=" << err;
+        })
+        .perform_sync();
+    return ok;
+}
 
-    auto fetch = [](const std::string& url, std::string& body) {
-        bool ok = false;
-        Http::get(url)
-            .timeout_connect(4)
-            .timeout_max(6)
-            .on_complete([&](std::string b, unsigned status) {
-                if (status == 200) {
-                    body = std::move(b);
-                    ok   = true;
-                }
-            })
-            .on_error([&](std::string, std::string err, unsigned status) {
-                BOOST_LOG_TRIVIAL(info) << "OrcaPrinterAgent: identity probe " << url
-                                        << " failed status=" << status << " err=" << err;
-            })
-            .perform_sync();
-        return ok;
-    };
+std::string extract_line_value(const std::string& body, const std::string& key)
+{
+    const auto pos = body.find(key);
+    if (pos == std::string::npos)
+        return {};
+    const auto value_start = pos + key.size();
+    const auto value_end   = body.find('\n', value_start);
+    std::string value      = body.substr(value_start, value_end == std::string::npos ? std::string::npos : value_end - value_start);
+    boost::trim(value);
+    return value;
+}
 
-    auto extract = [](const std::string& body, const std::string& start_token, char end_char) -> std::string {
-        const auto pos = body.find(start_token);
-        if (pos == std::string::npos)
-            return {};
-        const auto value_start = pos + start_token.size();
-        const auto value_end   = body.find(end_char, value_start);
-        std::string value      = body.substr(value_start, value_end == std::string::npos ? std::string::npos : value_end - value_start);
-        boost::trim(value);
-        return value;
-    };
+// Manual binding uses the OrcaSonar landing page as its sole identity source.
+// The page returns device_id and may return device_name/model_id.
+bool probe_orcasonar_landing_page(const std::string& host,
+                                  const std::string& port,
+                                  std::string&       device_id,
+                                  std::string&       device_name,
+                                  std::string&       model_id)
+{
+    device_name = ORCASONAR_FALLBACK;
+    model_id    = ORCASONAR_FALLBACK;
 
     std::string body;
-    if (fetch(origin + "/", body)) {
-        std::string id = extract(body, "device_id=", '\n');
-        if (!id.empty()) {
-            device_id = std::move(id);
+    if (fetch_orcasonar_body("http://" + host + ":" + port + "/", body)) {
+        device_id = extract_line_value(body, "device_id=");
+        const std::string name  = extract_line_value(body, "device_name=");
+        const std::string model = extract_line_value(body, "model_id=");
+        if (!name.empty())
+            device_name = name;
+        if (!model.empty())
+            model_id = model;
+        if (!device_id.empty())
             return true;
-        }
-    }
-
-    body.clear();
-    if (fetch(origin + "/upnp/device.xml", body)) {
-        std::string id = extract(body, "uuid:", '<');
-        if (!id.empty()) {
-            device_id = std::move(id);
-            return true;
-        }
     }
 
     return false;
+}
+
+// SSDP discovery uses the LOCATION URL's UPnP device description as its sole
+// identity source. OrcaSonar maps device_id/device_name/model_id to UDN,
+// friendlyName, and modelNumber respectively.
+bool parse_orcasonar_device_xml(const std::string& body,
+                                std::string&       device_id,
+                                std::string&       device_name,
+                                std::string&       model_id)
+{
+    device_name = ORCASONAR_FALLBACK;
+    model_id    = ORCASONAR_FALLBACK;
+
+    try {
+        boost::property_tree::ptree tree;
+        std::istringstream           stream(body);
+        boost::property_tree::read_xml(stream, tree, boost::property_tree::xml_parser::trim_whitespace);
+        const auto device = tree.get_child_optional("root.device");
+        if (!device)
+            return false;
+
+        std::string udn = device->get<std::string>("UDN", "");
+        boost::trim(udn);
+        if (boost::istarts_with(udn, "uuid:"))
+            device_id = udn.substr(5);
+        else
+            device_id = device->get<std::string>("device_id", "");
+        boost::trim(device_id);
+        if (device_id.empty())
+            return false;
+
+        device_name = device->get<std::string>("friendlyName", "");
+        if (device_name.empty())
+            device_name = device->get<std::string>("device_name", ORCASONAR_FALLBACK);
+        model_id = device->get<std::string>("modelNumber", "");
+        if (model_id.empty())
+            model_id = device->get<std::string>("model_id", ORCASONAR_FALLBACK);
+        boost::trim(device_name);
+        boost::trim(model_id);
+        if (device_name.empty())
+            device_name = ORCASONAR_FALLBACK;
+        if (model_id.empty())
+            model_id = ORCASONAR_FALLBACK;
+        return true;
+    } catch (const std::exception& error) {
+        BOOST_LOG_TRIVIAL(info) << "OrcaPrinterAgent: failed to parse OrcaSonar device.xml: " << error.what();
+        return false;
+    }
+}
+
+bool probe_orcasonar_device_xml(const std::string& location,
+                                std::string&       device_id,
+                                std::string&       device_name,
+                                std::string&       model_id)
+{
+    std::string body;
+    return fetch_orcasonar_body(location, body) && parse_orcasonar_device_xml(body, device_id, device_name, model_id);
+}
+
+// TEMP MOCK: OrcaSonar's push_status doesn't report storage state yet, so
+// DevStorage::ParseV1_0() decodes NO_SDCARD and SelectMachineDialog blocks
+// printing with "No SD card". Force the storage-present markers into every
+// forwarded status document so the printer reports HAS_SDCARD_NORMAL.
+// Remove once the firmware reports real storage state.
+std::string force_sdcard_present(const std::string& payload)
+{
+    nlohmann::json envelope = nlohmann::json::parse(payload, nullptr, false);
+    if (!envelope.is_object())
+        return payload;
+
+    const auto print_it = envelope.find("print");
+    if (print_it == envelope.end() || !print_it->is_object())
+        return payload;
+
+    // DevStorage::ParseV1_0() reads print.sdcard as a bool -> HAS_SDCARD_NORMAL.
+    (*print_it)["sdcard"] = true;
+
+    // MachineObject::parse_home_flag() runs afterwards and re-derives the state
+    // from bits 8-9 of print.home_flag; rewrite them to 01 so it doesn't clobber
+    // the mock back to NO_SDCARD.
+    const auto home_flag_it = print_it->find("home_flag");
+    if (home_flag_it != print_it->end() && home_flag_it->is_number_integer()) {
+        int flag      = home_flag_it->get<int>();
+        flag          = (flag & ~(0x3 << 8)) | (0x1 << 8);
+        *home_flag_it = flag;
+    }
+
+    return envelope.dump();
 }
 
 } // namespace
@@ -246,8 +334,7 @@ private:
         const std::size_t type_start = lower_usn.find(device_type, uuid_prefix.size());
         if (type_start == std::string::npos)
             return false;
-        const std::string device_id = trim_ascii(usn.substr(uuid_prefix.size(), type_start - uuid_prefix.size()));
-        if (device_id.empty() || host.empty())
+        if (host.empty())
             return false;
 
         const std::string lower_location = lower_ascii(location);
@@ -274,17 +361,34 @@ private:
         if (port.empty() || port.find_first_not_of("0123456789") != std::string::npos)
             return false;
 
+        // SSDP LOCATION commonly advertises the device's mDNS name (for
+        // example, http://orcasonar-123.local:8280/upnp/device.xml). The
+        // discovery response already gives us the sender's reachable address,
+        // so use that address for the HTTP probe instead of requiring the
+        // platform HTTP client to resolve .local. Keep the advertised path so
+        // this remains compatible with non-default device-description URLs.
+        const std::string location_path = authority_end == std::string::npos ? "/" : location.substr(authority_end);
+        const std::string probe_host    = host.find(':') == std::string::npos ? host : "[" + host + "]";
+        const std::string probe_url     = location.substr(0, scheme_end + 3) + probe_host + ":" + port + location_path;
+
+        std::string device_id;
+        std::string device_name;
+        std::string model_id;
+        if (!probe_orcasonar_device_xml(probe_url, device_id, device_name, model_id))
+            return false;
+
         nlohmann::json machine;
-        machine["dev_name"]        = device_id;
+        machine["dev_name"]        = device_name;
         machine["dev_id"]          = device_id;
+        machine["dev_type"]        = model_id;
+        machine["connection_name"] = device_id;
         machine["dev_ip"]          = host + ":" + port;
-        machine["dev_type"]        = "orcasonar";
+
         machine["dev_signal"]      = "0";
         machine["connect_type"]    = "lan";
         machine["bind_state"]      = "free";
         machine["sec_link"]        = "secure";
         machine["ssdp_version"]    = "v1";
-        machine["connection_name"] = device_id;
         json                       = machine.dump();
         return true;
     }
@@ -443,10 +547,8 @@ void OrcaPrinterAgent::deliver_to_sink(const std::string& dev_id, const std::str
         fn = on_message_fn;
         q  = queue_on_main_fn;
     }
-    BOOST_LOG_TRIVIAL(info) << "Orca diagnostic: delivering cloud message dev_id=" << dev_id
-                            << " payload_bytes=" << payload.size()
-                            << " callback=" << (fn ? "set" : "null")
-                            << " queue_on_main=" << (q ? "set" : "null");
+    BOOST_LOG_TRIVIAL(info) << "Orca diagnostic: delivering cloud message dev_id=" << dev_id << " payload_bytes=" << payload.size()
+                            << " callback=" << (fn ? "set" : "null") << " queue_on_main=" << (q ? "set" : "null");
     if (!fn) {
         BOOST_LOG_TRIVIAL(warning) << "Orca diagnostic: dropping cloud message because on_message_fn is not set"
                                    << " dev_id=" << dev_id;
@@ -469,10 +571,8 @@ void OrcaPrinterAgent::deliver_to_local_sink(const std::string& dev_id, const st
         fn = on_local_message_fn;
         q  = queue_on_main_fn;
     }
-    BOOST_LOG_TRIVIAL(info) << "Orca diagnostic: delivering LAN message dev_id=" << dev_id
-                            << " payload_bytes=" << payload.size()
-                            << " callback=" << (fn ? "set" : "null")
-                            << " queue_on_main=" << (q ? "set" : "null");
+    BOOST_LOG_TRIVIAL(info) << "Orca diagnostic: delivering LAN message dev_id=" << dev_id << " payload_bytes=" << payload.size()
+                            << " callback=" << (fn ? "set" : "null") << " queue_on_main=" << (q ? "set" : "null");
     if (!fn) {
         BOOST_LOG_TRIVIAL(warning) << "Orca diagnostic: dropping LAN message because on_local_message_fn is not set"
                                    << " dev_id=" << dev_id;
@@ -494,10 +594,8 @@ void OrcaPrinterAgent::dispatch_local_connect(int state, const std::string& dev_
         queue    = queue_on_main_fn;
     }
 
-    BOOST_LOG_TRIVIAL(info) << "Orca diagnostic: LAN connection callback state=" << state
-                            << " dev_id=" << dev_id << " message=" << message
-                            << " callback=" << (callback ? "set" : "null")
-                            << " queue_on_main=" << (queue ? "set" : "null");
+    BOOST_LOG_TRIVIAL(info) << "Orca diagnostic: LAN connection callback state=" << state << " dev_id=" << dev_id << " message=" << message
+                            << " callback=" << (callback ? "set" : "null") << " queue_on_main=" << (queue ? "set" : "null");
     if (!callback)
         return;
 
@@ -515,8 +613,7 @@ std::function<void(const std::string&, const std::string&)> OrcaPrinterAgent::ma
             deliver_to_local_sink(id, payload);
         else
             BOOST_LOG_TRIVIAL(info) << "Orca diagnostic: dropping stale LAN message generation=" << generation
-                                    << " current_generation=" << m_lan_generation.load()
-                                    << " dev_id=" << id;
+                                    << " current_generation=" << m_lan_generation.load() << " dev_id=" << id;
     };
 }
 
@@ -612,8 +709,7 @@ int OrcaPrinterAgent::command_auto_leveling(std::string dev_id, int sequence_id,
     return route_send(lan_mode, dev_id, j.dump());
 }
 
-int OrcaPrinterAgent::command_go_home(std::string dev_id, bool is_printing, bool supports_mqtt_homing,
-                                      int sequence_id, bool lan_mode)
+int OrcaPrinterAgent::command_go_home(std::string dev_id, bool is_printing, bool supports_mqtt_homing, int sequence_id, bool lan_mode)
 {
     nlohmann::json j;
     j["print"]["sequence_id"] = std::to_string(sequence_id);
@@ -627,8 +723,7 @@ int OrcaPrinterAgent::command_go_home(std::string dev_id, bool is_printing, bool
     return route_send(lan_mode, dev_id, j.dump());
 }
 
-int OrcaPrinterAgent::command_set_bed(std::string dev_id, int temp, bool /*supports_mqtt_bed_ctrl*/,
-                                      int sequence_id, bool lan_mode)
+int OrcaPrinterAgent::command_set_bed(std::string dev_id, int temp, bool /*supports_mqtt_bed_ctrl*/, int sequence_id, bool lan_mode)
 {
     nlohmann::json j;
     j["print"]["command"]     = "set_bed_temp";
@@ -647,9 +742,15 @@ int OrcaPrinterAgent::command_set_nozzle(std::string dev_id, int temp, int seque
     return route_send(lan_mode, dev_id, j.dump());
 }
 
-int OrcaPrinterAgent::command_axis_control(std::string dev_id, std::string axis, double unit, double input_val,
-                                           int /*speed*/, bool is_core_xy, bool /*supports_mqtt_axis_control*/,
-                                           int sequence_id, bool lan_mode)
+int OrcaPrinterAgent::command_axis_control(std::string dev_id,
+                                           std::string axis,
+                                           double unit,
+                                           double input_val,
+                                           int /*speed*/,
+                                           bool is_core_xy,
+                                           bool /*supports_mqtt_axis_control*/,
+                                           int sequence_id,
+                                           bool lan_mode)
 {
     std::transform(axis.begin(), axis.end(), axis.begin(), [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
     if (axis != "X" && axis != "Y" && axis != "Z" && axis != "E") {
@@ -659,8 +760,7 @@ int OrcaPrinterAgent::command_axis_control(std::string dev_id, std::string axis,
 
     const double requested_distance = input_val * unit;
     if (!std::isfinite(requested_distance) || requested_distance == 0.0) {
-        BOOST_LOG_TRIVIAL(warning) << "OrcaPrinterAgent: invalid axis control distance input=" << input_val
-                                   << " unit=" << unit;
+        BOOST_LOG_TRIVIAL(warning) << "OrcaPrinterAgent: invalid axis control distance input=" << input_val << " unit=" << unit;
         return BAMBU_NETWORK_ERR_INVALID_HANDLE;
     }
 
@@ -716,7 +816,7 @@ bool OrcaPrinterAgent::parse_nonnegative_command_id(const std::string& value, in
     if (value.empty())
         return false;
     try {
-        std::size_t consumed = 0;
+        std::size_t consumed   = 0;
         const long long parsed = std::stoll(value, &consumed);
         if (consumed != value.size() || parsed < 0 || parsed > std::numeric_limits<int>::max())
             return false;
@@ -738,18 +838,18 @@ void OrcaPrinterAgent::parse_ipcam_info(const std::string& dev_id, const std::st
         return;
 
     const nlohmann::json& print = *print_it;
-    const auto command_it = print.find("command");
-    const bool is_push_status = command_it != print.end() && command_it->is_string() && command_it->get<std::string>() == "push_status";
-    bool is_full_snapshot = false;
+    const auto command_it       = print.find("command");
+    const bool is_push_status   = command_it != print.end() && command_it->is_string() && command_it->get<std::string>() == "push_status";
+    bool is_full_snapshot       = false;
     if (is_push_status) {
         const auto msg_it = print.find("msg");
-        is_full_snapshot = msg_it == print.end() || (msg_it->is_number_integer() && msg_it->get<int>() == 0);
+        is_full_snapshot  = msg_it == print.end() || (msg_it->is_number_integer() && msg_it->get<int>() == 0);
     }
 
     CameraStreamMode stream_mode = CameraStreamMode::none;
     std::string stream_url;
     bool has_camera_update = false;
-    const auto ipcam_it = print.find("ipcam");
+    const auto ipcam_it    = print.find("ipcam");
     if (ipcam_it != print.end() && ipcam_it->is_object()) {
         const auto stream_modes_it = ipcam_it->find("stream_mode");
         if (stream_modes_it != ipcam_it->end() && stream_modes_it->is_array()) {
@@ -758,7 +858,7 @@ void OrcaPrinterAgent::parse_ipcam_info(const std::string& dev_id, const std::st
                 if (!stream.is_object())
                     continue;
                 const auto mode_it = stream.find("mode");
-                const auto url_it = stream.find("url");
+                const auto url_it  = stream.find("url");
                 if (mode_it == stream.end() || url_it == stream.end() || !mode_it->is_string() || !url_it->is_string())
                     continue;
 
@@ -775,8 +875,7 @@ void OrcaPrinterAgent::parse_ipcam_info(const std::string& dev_id, const std::st
                 stream_url = url_it->get<std::string>();
                 break; // OrcaSonar orders entries by preference.
             }
-        }
-        else if (is_full_snapshot) {
+        } else if (is_full_snapshot) {
             has_camera_update = true;
         }
     } else if (is_full_snapshot) {
@@ -795,11 +894,9 @@ void OrcaPrinterAgent::parse_ipcam_info(const std::string& dev_id, const std::st
     }
 
     m_camera_stream_mode = stream_mode;
-    m_camera_url = std::move(stream_url);
-    BOOST_LOG_TRIVIAL(info) << "Orca diagnostic: updated camera state dev_id=" << dev_id
-                            << " transport=LAN"
-                            << " mode=" << static_cast<int>(m_camera_stream_mode)
-                            << " url=" << m_camera_url;
+    m_camera_url         = std::move(stream_url);
+    BOOST_LOG_TRIVIAL(info) << "Orca diagnostic: updated camera state dev_id=" << dev_id << " transport=LAN"
+                            << " mode=" << static_cast<int>(m_camera_stream_mode) << " url=" << m_camera_url;
 }
 
 std::string OrcaPrinterAgent::lan_connection_target() const
@@ -845,9 +942,9 @@ void OrcaPrinterAgent::on_connected(const std::string& dev_id, OrcaMqttConnectio
 
 int OrcaPrinterAgent::connect_printer(std::string dev_id, std::string dev_ip, std::string username, std::string password, bool use_ssl)
 {
-    BOOST_LOG_TRIVIAL(info) << "Orca diagnostic: connect_printer requested dev_id=" << dev_id
-                            << " dev_ip=" << dev_ip << " username=" << (username.empty() ? "<default>" : username)
-                            << " password_present=" << (!password.empty()) << " use_ssl=" << use_ssl;
+    BOOST_LOG_TRIVIAL(info) << "Orca diagnostic: connect_printer requested dev_id=" << dev_id << " dev_ip=" << dev_ip
+                            << " username=" << (username.empty() ? "<default>" : username) << " password_present=" << (!password.empty())
+                            << " use_ssl=" << use_ssl;
     (void) use_ssl; // OrcaSonar LAN is plaintext ws://
     if (dev_id.empty() || dev_ip.empty()) {
         BOOST_LOG_TRIVIAL(warning) << "Orca diagnostic: connect_printer rejected missing dev_id or dev_ip";
@@ -869,16 +966,15 @@ int OrcaPrinterAgent::connect_printer(std::string dev_id, std::string dev_ip, st
     cfg.client_id         = make_lan_client_id(dev_id);
     cfg.keepalive_seconds = 60;
 
-    BOOST_LOG_TRIVIAL(info) << "Orca diagnostic: LAN connection prepared generation=" << gen
-                            << " host=" << host << " port=" << port << " url=" << cfg.url
-                            << " mqtt_username=" << cfg.username << " password_present=" << (!cfg.password.empty())
+    BOOST_LOG_TRIVIAL(info) << "Orca diagnostic: LAN connection prepared generation=" << gen << " host=" << host << " port=" << port
+                            << " url=" << cfg.url << " mqtt_username=" << cfg.username << " password_present=" << (!cfg.password.empty())
                             << " client_id=" << cfg.client_id;
 
     OrcaMqttConnection* conn = nullptr;
     CurrentConn previous_connection;
     {
         std::lock_guard<std::mutex> l(state_mutex);
-        previous_connection   = m_current_connection;
+        previous_connection  = m_current_connection;
         m_lan_dev_id         = dev_id;
         m_lan_url            = cfg.url;
         m_camera_stream_mode = CameraStreamMode::none;
@@ -893,17 +989,16 @@ int OrcaPrinterAgent::connect_printer(std::string dev_id, std::string dev_ip, st
     if (m_lan_connect_thread.joinable())
         m_lan_connect_thread.join(); // disconnect_printer() above already stopped the old conn, so this is fast
     m_lan_connect_thread = std::thread([this, conn, cfg, dev_id, gen] {
-        BOOST_LOG_TRIVIAL(info) << "Orca diagnostic: LAN connect worker started generation=" << gen
-                                << " dev_id=" << dev_id << " url=" << cfg.url;
+        BOOST_LOG_TRIVIAL(info) << "Orca diagnostic: LAN connect worker started generation=" << gen << " dev_id=" << dev_id
+                                << " url=" << cfg.url;
         if (gen != m_lan_generation.load()) {
             BOOST_LOG_TRIVIAL(info) << "Orca diagnostic: LAN connect worker abandoned before start generation=" << gen
                                     << " current_generation=" << m_lan_generation.load();
             return; // superseded before we ran: never raise a socket nobody will tear down
         }
         const bool ok = conn->start(cfg, make_lan_message_handler(gen), [this, gen, dev_id, conn](bool connected, bool initial) {
-            BOOST_LOG_TRIVIAL(info) << "Orca diagnostic: LAN MQTT state callback connected=" << connected
-                                    << " initial=" << initial << " generation=" << gen
-                                    << " current_generation=" << m_lan_generation.load()
+            BOOST_LOG_TRIVIAL(info) << "Orca diagnostic: LAN MQTT state callback connected=" << connected << " initial=" << initial
+                                    << " generation=" << gen << " current_generation=" << m_lan_generation.load()
                                     << " connack_rc=" << conn->last_connack_rc();
             if (gen != m_lan_generation.load()) {
                 BOOST_LOG_TRIVIAL(info) << "Orca diagnostic: ignoring stale LAN MQTT state callback generation=" << gen;
@@ -916,21 +1011,19 @@ int OrcaPrinterAgent::connect_printer(std::string dev_id, std::string dev_ip, st
                 dispatch_local_connect(ConnectStatusLost, dev_id, "connection_lost");
             }
         });
-        BOOST_LOG_TRIVIAL(info) << "Orca diagnostic: LAN MQTT start returned ok=" << ok
-                                << " generation=" << gen << " current_generation=" << m_lan_generation.load()
-                                << " connected=" << conn->is_connected() << " running=" << conn->is_running()
-                                << " connack_rc=" << conn->last_connack_rc();
+        BOOST_LOG_TRIVIAL(info) << "Orca diagnostic: LAN MQTT start returned ok=" << ok << " generation=" << gen
+                                << " current_generation=" << m_lan_generation.load() << " connected=" << conn->is_connected()
+                                << " running=" << conn->is_running() << " connack_rc=" << conn->last_connack_rc();
         if (ok && gen == m_lan_generation.load()) {
             on_connected(dev_id, conn, gen);
             dispatch_local_connect(ConnectStatusOk, dev_id, "0");
         } else if (!ok && gen == m_lan_generation.load() && !conn->is_running()) {
             // A refusal with rc 4/5 terminates the transport. Network errors keep
             // retrying in OrcaMqttConnection, so leave the UI in its connecting state.
-            const int rc = conn->last_connack_rc();
+            const int rc             = conn->last_connack_rc();
             const std::string reason = rc >= 0 ? std::to_string(rc) : "initial_connect_failed";
             BOOST_LOG_TRIVIAL(warning) << "Orca diagnostic: LAN MQTT connection terminated before readiness"
-                                       << " generation=" << gen << " connack_rc=" << rc
-                                       << " reason=" << reason;
+                                       << " generation=" << gen << " connack_rc=" << rc << " reason=" << reason;
             dispatch_local_connect(ConnectStatusFailed, dev_id, reason);
         } else if (!ok && gen == m_lan_generation.load()) {
             BOOST_LOG_TRIVIAL(warning) << "Orca diagnostic: LAN MQTT initial attempt failed but worker is retrying"
@@ -954,8 +1047,8 @@ int OrcaPrinterAgent::disconnect_printer()
     {
         std::lock_guard<std::mutex> l(state_mutex);
         previous_connection = m_current_connection;
-        doomed   = std::move(lan_mqtt_connection);
-        prev_dev = m_lan_dev_id;
+        doomed              = std::move(lan_mqtt_connection);
+        prev_dev            = m_lan_dev_id;
         m_lan_dev_id.clear();
         if (m_current_connection == LAN) {
             m_current_connection = NONE;
@@ -964,8 +1057,8 @@ int OrcaPrinterAgent::disconnect_printer()
         }
         current_connection = m_current_connection;
     }
-    BOOST_LOG_TRIVIAL(info) << "Orca diagnostic: LAN disconnect generation=" << m_lan_generation.load()
-                            << " previous_dev_id=" << prev_dev << " had_connection=" << (doomed ? "yes" : "no")
+    BOOST_LOG_TRIVIAL(info) << "Orca diagnostic: LAN disconnect generation=" << m_lan_generation.load() << " previous_dev_id=" << prev_dev
+                            << " had_connection=" << (doomed ? "yes" : "no")
                             << " connected=" << (doomed && doomed->is_connected() ? "yes" : "no")
                             << " transport=" << connection_type_name(previous_connection) << "->"
                             << connection_type_name(current_connection);
@@ -1005,16 +1098,16 @@ int OrcaPrinterAgent::route_send(bool is_lan, const std::string& dev_id, const s
         // Preserve the transport's existing behavior for malformed payloads;
         // the printer will report the protocol error asynchronously.
     }
-    BOOST_LOG_TRIVIAL(info) << "OrcaPrinterAgent::route_send is_lan=" << is_lan << " dev_id=" << dev_id
-                            << " command=" << command << " payload_bytes=" << json_str.size();
+    BOOST_LOG_TRIVIAL(info) << "OrcaPrinterAgent::route_send is_lan=" << is_lan << " dev_id=" << dev_id << " command=" << command
+                            << " payload_bytes=" << json_str.size();
     if (dev_id.empty())
         return BAMBU_NETWORK_ERR_INVALID_HANDLE;
     OrcaMqttConnection* conn = get_appropriate_mqtt_connection(is_lan);
     if (!conn)
         return BAMBU_NETWORK_ERR_INVALID_HANDLE;
     const bool queued = conn->send_request(dev_id, json_str);
-    BOOST_LOG_TRIVIAL(info) << "OrcaPrinterAgent::route_send command=" << command << " queued=" << queued
-                            << " is_lan=" << is_lan << " dev_id=" << dev_id;
+    BOOST_LOG_TRIVIAL(info) << "OrcaPrinterAgent::route_send command=" << command << " queued=" << queued << " is_lan=" << is_lan
+                            << " dev_id=" << dev_id;
     return queued ? BAMBU_NETWORK_SUCCESS : BAMBU_NETWORK_ERR_CONNECTION_TO_SERVER_FAILED;
 }
 
@@ -1087,20 +1180,21 @@ int OrcaPrinterAgent::bind_detect(std::string dev_ip, std::string /*sec_link*/, 
     }
 
     std::string device_id;
-    if (!probe_orcasonar_device_id(host, port, device_id) || device_id.empty()) {
+    std::string device_name;
+    std::string model_id;
+    if (!probe_orcasonar_landing_page(host, port, device_id, device_name, model_id) || device_id.empty()) {
         BOOST_LOG_TRIVIAL(warning) << "OrcaPrinterAgent::bind_detect: no OrcaSonar reachable at " << host << ":" << port;
         return BAMBU_NETWORK_ERR_INVALID_HANDLE;
     }
 
     detect.dev_id       = device_id;
-    detect.dev_name     = device_id;
-    detect.model_id     = ""; // unknown; DeviceManager::insert_local_device defaults it
+    detect.dev_name     = device_name;
+    detect.model_id     = model_id;
     detect.version      = "";
     detect.connect_type = "lan";  // required by MachineObject::is_lan_mode_printer()
     detect.bind_state   = "free"; // required by MachineObject::is_avaliable()
     detect.result_msg   = "";
-    BOOST_LOG_TRIVIAL(info) << "OrcaPrinterAgent::bind_detect: found OrcaSonar dev_id=" << device_id
-                            << " at " << host << ":" << port;
+    BOOST_LOG_TRIVIAL(info) << "OrcaPrinterAgent::bind_detect: found OrcaSonar dev_id=" << device_id << " at " << host << ":" << port;
     return BAMBU_NETWORK_SUCCESS;
 }
 
@@ -1161,7 +1255,7 @@ int OrcaPrinterAgent::set_user_selected_machine(std::string dev_id)
         // selection. Conversely, selecting a cloud machine with the same id
         // while LAN is active is still a transport switch and must proceed.
         const bool same_selection = dev_id == selected_machine;
-        const bool same_transport  = dev_id.empty() ? m_current_connection != CLOUD : m_current_connection == CLOUD;
+        const bool same_transport = dev_id.empty() ? m_current_connection != CLOUD : m_current_connection == CLOUD;
         if (same_selection && same_transport) {
             BOOST_LOG_TRIVIAL(info) << "OrcaPrinterAgent::set_user_selected_machine: unchanged dev_id=" << dev_id
                                     << " transport=" << connection_type_name(m_current_connection);
@@ -1183,8 +1277,7 @@ int OrcaPrinterAgent::set_user_selected_machine(std::string dev_id)
         current_connection = m_current_connection;
     }
     BOOST_LOG_TRIVIAL(info) << "OrcaPrinterAgent::set_user_selected_machine: previous=" << previous << " new=" << dev_id
-                            << " cloud=" << (cloud ? "set" : "<null>") << " transport="
-                            << connection_type_name(previous_connection) << "->"
+                            << " cloud=" << (cloud ? "set" : "<null>") << " transport=" << connection_type_name(previous_connection) << "->"
                             << connection_type_name(current_connection);
     if (!cloud) {
         BOOST_LOG_TRIVIAL(warning) << "OrcaPrinterAgent::set_user_selected_machine: no Orca cloud agent";
@@ -1240,13 +1333,16 @@ int OrcaPrinterAgent::start_local_print_with_record(PrintParams params,
 // Upload one G-code file to the printer's `gcodes` root over OrcaSonar's
 // Moonraker-compatible HTTP facade. No print is started here (print=false); the
 // caller issues print.gcode_file over MQTT separately (start_sdcard_print).
-int OrcaPrinterAgent::start_send_gcode_to_sdcard(PrintParams params, OnUpdateStatusFn update_fn, WasCancelledFn cancel_fn, OnWaitFn /*wait_fn*/)
+int OrcaPrinterAgent::start_send_gcode_to_sdcard(PrintParams params,
+                                                 OnUpdateStatusFn update_fn,
+                                                 WasCancelledFn cancel_fn,
+                                                 OnWaitFn /*wait_fn*/)
 {
     if (update_fn)
         update_fn(PrintingStageCreate, 0, "Preparing...");
 
     const std::string local_path = resolve_local_gcode_path(params);
-    const fs::path    source(local_path);
+    const fs::path source(local_path);
     boost::system::error_code ec;
     if (!fs::exists(source, ec) || !fs::is_regular_file(source, ec)) {
         BOOST_LOG_TRIVIAL(error) << "OrcaPrinterAgent: G-code file does not exist: " << local_path;
@@ -1265,7 +1361,7 @@ int OrcaPrinterAgent::start_send_gcode_to_sdcard(PrintParams params, OnUpdateSta
 
     std::string host, port, origin;
     if (parse_lan_endpoint(params.dev_ip, host, port))
-        origin = "http://" + host + ":" + port;
+        origin = "http://" + host;
     else
         origin = http_origin_from_lan_ws(lan_connection_target());
     if (origin.empty()) {
@@ -1274,14 +1370,14 @@ int OrcaPrinterAgent::start_send_gcode_to_sdcard(PrintParams params, OnUpdateSta
     }
 
     const std::string upload_name = remote_gcode_name(params);
-    BOOST_LOG_TRIVIAL(info) << "OrcaPrinterAgent: uploading G-code " << local_path << " -> " << origin
-                            << "/server/files/upload as " << upload_name << " (" << file_size << " bytes)";
+    BOOST_LOG_TRIVIAL(info) << "OrcaPrinterAgent: uploading G-code " << local_path << " -> " << origin << "/server/files/upload as "
+                            << upload_name << " (" << file_size << " bytes)";
 
     if (update_fn)
         update_fn(PrintingStageUpload, 0, "Uploading...");
 
-    bool        canceled = false;
-    long        http_status = 0;
+    bool canceled    = false;
+    long http_status = 0;
     std::string http_error;
     std::string response_body;
 
@@ -1322,8 +1418,8 @@ int OrcaPrinterAgent::start_send_gcode_to_sdcard(PrintParams params, OnUpdateSta
 
     // OrcaSonar's Moonraker facade returns 201 Created on a successful save.
     if (http_status != 200 && http_status != 201) {
-        BOOST_LOG_TRIVIAL(warning) << "OrcaPrinterAgent: G-code upload failed http_status=" << http_status
-                                   << " error=" << http_error << " body=" << response_body;
+        BOOST_LOG_TRIVIAL(warning) << "OrcaPrinterAgent: G-code upload failed http_status=" << http_status << " error=" << http_error
+                                   << " body=" << response_body;
         return BAMBU_NETWORK_ERR_PRINT_SG_UPLOAD_FTP_FAILED;
     }
 
@@ -1363,8 +1459,7 @@ int OrcaPrinterAgent::start_sdcard_print(PrintParams params, OnUpdateStatusFn up
 
     // dst_file, when set, names a file already on the printer (print-from-SD flow);
     // otherwise start what start_send_gcode_to_sdcard just uploaded to `gcodes`.
-    const std::string target = params.dst_file.empty() ? remote_gcode_name(params)
-                                                       : fs::path(params.dst_file).filename().string();
+    const std::string target = params.dst_file.empty() ? remote_gcode_name(params) : fs::path(params.dst_file).filename().string();
 
     nlohmann::json j;
     j["print"]["command"]     = "gcode_file";
@@ -1375,10 +1470,10 @@ int OrcaPrinterAgent::start_sdcard_print(PrintParams params, OnUpdateStatusFn up
         update_fn(PrintingStageSending, 0, "Starting print...");
 
     const bool is_lan = params.connection_type == "lan";
-    const int  rc     = route_send(is_lan, params.dev_id, j.dump());
+    const int rc      = route_send(is_lan, params.dev_id, j.dump());
     if (rc != BAMBU_NETWORK_SUCCESS) {
-        BOOST_LOG_TRIVIAL(warning) << "OrcaPrinterAgent: start_sdcard_print publish failed rc=" << rc
-                                   << " dev_id=" << params.dev_id << " param=" << target;
+        BOOST_LOG_TRIVIAL(warning) << "OrcaPrinterAgent: start_sdcard_print publish failed rc=" << rc << " dev_id=" << params.dev_id
+                                   << " param=" << target;
         return BAMBU_NETWORK_ERR_PRINT_LP_PUBLISH_MSG_FAILED;
     }
 

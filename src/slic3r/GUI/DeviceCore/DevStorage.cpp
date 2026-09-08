@@ -20,8 +20,8 @@ DevStorage::SdcardState Slic3r::DevStorage::set_sdcard_state(int state)
      if (system)
      {
         try {
-            if (print_json.contains("sdcard")) {
-                if (print_json["sdcard"].get<bool>())
+            if (print_json.contains("sdcard") || print_json.contains("support_send_to_sd")) {
+                if (print_json["sdcard"].get<bool>() || print_json["support_send_to_sd"].get<bool>())
                     system->m_sdcard_state = DevStorage::SdcardState::HAS_SDCARD_NORMAL;
                 else
                     system->m_sdcard_state = DevStorage::SdcardState::NO_SDCARD;
