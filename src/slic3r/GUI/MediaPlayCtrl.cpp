@@ -10,6 +10,8 @@
 #include "slic3r/Utils/BBLNetworkPlugin.hpp"
 
 
+#include <algorithm>
+
 #include <boost/lexical_cast.hpp>
 #include <boost/log/trivial.hpp>
 #include <boost/nowide/cstdio.hpp>
@@ -166,8 +168,10 @@ void MediaPlayCtrl::SetMachineObject(MachineObject* obj)
 {
     const CameraStreamMode mode = current_mode();
     if (mode != m_last_mode) {
-        if (m_last_state != MEDIASTATE_IDLE)
+        if (m_last_state != MEDIASTATE_IDLE) {
+            m_failed_code = 0; // a mode switch is not a stream failure - don't arm back-off
             Stop(" ");
+        }
         m_last_mode = mode;
     }
 
@@ -189,7 +193,12 @@ void MediaPlayCtrl::SetMachineObject(MachineObject* obj)
                 Play();
             return;
         }
+        // A genuine machine/URL switch: not a failure, so drop any pending
+        // failure back-off before (re)starting on the new target.
         m_web_user_stopped = false;
+        m_failed_code  = 0;
+        m_failed_retry = 0;
+        m_next_retry   = wxDateTime();
         if (m_last_state != MEDIASTATE_IDLE)
             Stop(" ");
         if (IsEnabled())
@@ -552,19 +561,43 @@ void MediaPlayCtrl::Stop(wxString const &msg, wxString const &msg2)
     }
     switch (current_mode()) {
     case CameraStreamMode::http:
-    case CameraStreamMode::http_snapshot:
+    case CameraStreamMode::http_snapshot: {
+        const bool snapshot = current_mode() == CameraStreamMode::http_snapshot;
         if (m_last_state != MEDIASTATE_IDLE) {
-            if (m_web_ctrl) m_web_ctrl->Stop();
+            if (snapshot) {
+                if (m_web_ctrl) m_web_ctrl->Stop();
+            } else {
+                // http mode plays through the ffmpeg backend (m_media_ctrl), not
+                // the webview - tear its read thread down too, otherwise it keeps
+                // pulling and painting frames after the UI says "Video Stopped".
+                boost::unique_lock lock(m_mutex);
+                m_tasks.push_back("<stop>");
+                m_cond.notify_all();
+            }
             m_button_play->SetIcon("media_play");
             m_last_state = MEDIASTATE_IDLE;
             if (!msg.IsEmpty())
                 SetStatus(msg);
             else
                 SetStatus(_L("Video Stopped."), false);
+            // SetMachineObject re-drives Play() on every device refresh (~1s).
+            // This branch returns before the legacy back-off below, so on a real
+            // failure it has to arm m_next_retry itself or the stream restarts
+            // once a second forever. Escalate 5s..30s; m_failed_retry is cleared
+            // on success (onStateChanged) and on a deliberate switch
+            // (SetMachineObject), and a manual play via TogglePlay resets both.
+            if (m_failed_code != 0) {
+                const bool auto_retry = wxGetApp().app_config->get("liveview", "auto_retry") != "false";
+                ++m_failed_retry;
+                m_next_retry = auto_retry
+                    ? wxDateTime::Now() + wxTimeSpan::Seconds(std::min(5 * m_failed_retry, 30))
+                    : wxDateTime::Now() + wxTimeSpan::Days(1); // "off": wait for a manual retry
+            }
         } else if (!msg.IsEmpty()) {
             SetStatus(msg, false);
         }
         return;
+    }
     default:
         break;
     }

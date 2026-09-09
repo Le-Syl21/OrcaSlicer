@@ -4,8 +4,13 @@
 #include "libslic3r/Utils.hpp"
 #include <boost/log/trivial.hpp>
 #include <wx/dcclient.h>
+#include <cstdarg>
+#include <cstdlib>
+#include <cstring>
+#include <mutex>
 extern "C" {
 #include <libavformat/avformat.h>
+#include <libavutil/log.h>
 }
 #ifdef __WIN32__
 #include <versionhelpers.h>
@@ -250,6 +255,58 @@ void wxMediaCtrl3::bambu_log(void *ctx, int level, tchar const *msg2)
     BOOST_LOG_TRIVIAL(info) << msg.ToUTF8().data();
 }
 
+// FFmpeg's own diagnostics (HTTP status, "Invalid data found", demuxer choice,
+// missing stream dimensions, ...) are otherwise swallowed: a failed camera open
+// only surfaces as wxMediaCtrl3's generic error code, which MediaPlayCtrl maps to
+// the misleading "Player is malfunctioning" string. Forward them to the Orca log
+// instead. Verbosity defaults to AV_LOG_VERBOSE and can be raised at runtime with
+// ORCA_FFMPEG_LOG_LEVEL=debug|trace|... (or lowered to warning/error/quiet).
+static int ffmpeg_log_level_from_env()
+{
+    const char *env = std::getenv("ORCA_FFMPEG_LOG_LEVEL");
+    if (env == nullptr || *env == '\0')
+        return AV_LOG_VERBOSE;
+    const wxString v = wxString(env).Lower();
+    if (v == "quiet")   return AV_LOG_QUIET;
+    if (v == "panic")   return AV_LOG_PANIC;
+    if (v == "fatal")   return AV_LOG_FATAL;
+    if (v == "error")   return AV_LOG_ERROR;
+    if (v == "warning") return AV_LOG_WARNING;
+    if (v == "info")    return AV_LOG_INFO;
+    if (v == "verbose") return AV_LOG_VERBOSE;
+    if (v == "debug")   return AV_LOG_DEBUG;
+    if (v == "trace")   return AV_LOG_TRACE;
+    return AV_LOG_VERBOSE;
+}
+
+static void ffmpeg_log_callback(void *avcl, int level, const char *fmt, va_list vl)
+{
+    if (level > av_log_get_level())
+        return;
+    thread_local int print_prefix = 1;
+    char line[1024];
+    av_log_format_line2(avcl, level, fmt, vl, line, (int) sizeof(line), &print_prefix);
+    size_t len = std::strlen(line);
+    while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r' || line[len - 1] == ' '))
+        line[--len] = '\0';
+    if (len == 0)
+        return;
+    if (level <= AV_LOG_ERROR)
+        BOOST_LOG_TRIVIAL(error) << "ffmpeg: " << line;
+    else if (level <= AV_LOG_WARNING)
+        BOOST_LOG_TRIVIAL(warning) << "ffmpeg: " << line;
+    else if (level <= AV_LOG_INFO)
+        BOOST_LOG_TRIVIAL(info) << "ffmpeg: " << line;
+    else
+        BOOST_LOG_TRIVIAL(debug) << "ffmpeg: " << line;
+}
+
+static void install_ffmpeg_logger()
+{
+    av_log_set_level(ffmpeg_log_level_from_env());
+    av_log_set_callback(&ffmpeg_log_callback);
+}
+
 int wxMediaCtrl3::ffmpeg_interrupt_callback(void *opaque)
 {
     auto *ctrl = static_cast<wxMediaCtrl3 *>(opaque);
@@ -259,6 +316,9 @@ int wxMediaCtrl3::ffmpeg_interrupt_callback(void *opaque)
 
 int wxMediaCtrl3::PlayFfmpeg(std::shared_ptr<wxURI> const &url, std::unique_lock<std::mutex> &lock)
 {
+    static std::once_flag logger_once;
+    std::call_once(logger_once, install_ffmpeg_logger);
+
     if (avformat_network_init() < 0)
         return 2;
 
@@ -287,13 +347,22 @@ int wxMediaCtrl3::PlayFfmpeg(std::shared_ptr<wxURI> const &url, std::unique_lock
     const bool http_stream = scheme.CmpNoCase("http") == 0 || scheme.CmpNoCase("https") == 0;
     AVDictionary *options = nullptr;
     if (http_stream) {
-        // This is a live multipart MJPEG stream. Keep FFmpeg from building a
-        // read-ahead buffer, otherwise the UI can display frames several
-        // seconds behind the camera.
+        // Live multipart MJPEG. fflags=nobuffer / AVFMT_FLAG_NOBUFFER / max_delay=0
+        // (set above) are the low-latency levers - they disable the demuxer
+        // read-ahead queue. probesize / analyzeduration only bound the one-off
+        // avformat_find_stream_info() at open; a 32-byte budget returned before a
+        // whole JPEG frame was seen, so width/height came back unset and the open
+        // was rejected. Give it room to identify one frame (a startup cost only).
+        // rw_timeout / timeout bound a wedged connect or read so a stale stream
+        // fails fast and is retried, instead of the reader thread hanging.
+        // avioflags=direct is deliberately NOT set: unbuffered reads make the
+        // mpjpeg demuxer emit "Packet corrupt" and bail on any short read across
+        // a multipart boundary.
         av_dict_set(&options, "fflags", "nobuffer", 0);
-        av_dict_set(&options, "avioflags", "direct", 0);
-        av_dict_set(&options, "probesize", "32", 0);
-        av_dict_set(&options, "analyzeduration", "0", 0);
+        av_dict_set(&options, "probesize", "5000000", 0);
+        av_dict_set(&options, "analyzeduration", "1000000", 0);
+        av_dict_set(&options, "rw_timeout", "5000000", 0);
+        av_dict_set(&options, "timeout", "5000000", 0);
     } else {
         av_dict_set(&options, "rtsp_transport", "tcp", 0);
     }
@@ -318,12 +387,21 @@ int wxMediaCtrl3::PlayFfmpeg(std::shared_ptr<wxURI> const &url, std::unique_lock
     if (decoder.open(*format_context->streams[video_stream]->codecpar) < 0)
         return finish(2);
 
-    m_video_size = {format_context->streams[video_stream]->codecpar->width,
-                    format_context->streams[video_stream]->codecpar->height};
-    if (!m_video_size.IsFullySpecified() || m_video_size.x <= 0 || m_video_size.y <= 0)
-        return finish(2);
-    adjust_frame_size(m_frame_size, m_video_size, GetSize());
-    NotifyStopped();
+    // Prefer the dimensions the container reported. A small probe budget, or a
+    // camera that doesn't announce a size up front, can leave these unset - in
+    // that case fill them in from the first frame that decodes (below) rather
+    // than failing the open outright.
+    auto apply_video_size = [&](wxSize size) {
+        if (!size.IsFullySpecified() || size.x <= 0 || size.y <= 0)
+            return false;
+        m_video_size = size;
+        adjust_frame_size(m_frame_size, m_video_size, GetSize());
+        NotifyStopped();
+        return true;
+    };
+    bool have_size = apply_video_size({format_context->streams[video_stream]->codecpar->width,
+                                      format_context->streams[video_stream]->codecpar->height});
+    int size_probe_frames = 0; // frames spent still waiting for a usable size
 
     AVPacket *packet = av_packet_alloc();
     if (!packet)
@@ -340,6 +418,18 @@ int wxMediaCtrl3::PlayFfmpeg(std::shared_ptr<wxURI> const &url, std::unique_lock
         if (packet->stream_index == video_stream) {
             const int decode_error = decoder.decode(*packet);
             if (decode_error == 0) {
+                if (!have_size) {
+                    have_size = apply_video_size(decoder.decoded_frame_size());
+                    if (!have_size) {
+                        av_packet_unref(packet);
+                        // MJPEG yields a sized frame on the first full packet; if
+                        // several seconds of frames never do, treat it as a bad
+                        // stream instead of sitting in "Loading..." forever.
+                        if (++size_probe_frames > 120)
+                            break;
+                        continue;
+                    }
+                }
                 auto frame_size = m_frame_size;
                 lock.unlock();
 #ifdef _WIN32
