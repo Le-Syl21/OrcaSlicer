@@ -5,6 +5,7 @@
 #include "NetworkAgentFactory.hpp"
 #include "OrcaCloudServiceAgent.hpp"
 #include "bambu_networking.hpp"
+#include "json_diff.hpp"
 #include <algorithm>
 #include <atomic>
 #include <boost/algorithm/string.hpp>
@@ -145,18 +146,15 @@ std::string extract_line_value(const std::string& body, const std::string& key)
 
 // Manual binding uses the OrcaSonar landing page as its sole identity source.
 // The page returns device_id and may return device_name/model_id.
-bool probe_orcasonar_landing_page(const std::string& host,
-                                  const std::string& port,
-                                  std::string&       device_id,
-                                  std::string&       device_name,
-                                  std::string&       model_id)
+bool probe_orcasonar_landing_page(
+    const std::string& host, const std::string& port, std::string& device_id, std::string& device_name, std::string& model_id)
 {
     device_name = ORCASONAR_FALLBACK;
     model_id    = ORCASONAR_FALLBACK;
 
     std::string body;
     if (fetch_orcasonar_body("http://" + host + ":" + port + "/", body)) {
-        device_id = extract_line_value(body, "device_id=");
+        device_id               = extract_line_value(body, "device_id=");
         const std::string name  = extract_line_value(body, "device_name=");
         const std::string model = extract_line_value(body, "model_id=");
         if (!name.empty())
@@ -173,17 +171,14 @@ bool probe_orcasonar_landing_page(const std::string& host,
 // SSDP discovery uses the LOCATION URL's UPnP device description as its sole
 // identity source. OrcaSonar maps device_id/device_name/model_id to UDN,
 // friendlyName, and modelNumber respectively.
-bool parse_orcasonar_device_xml(const std::string& body,
-                                std::string&       device_id,
-                                std::string&       device_name,
-                                std::string&       model_id)
+bool parse_orcasonar_device_xml(const std::string& body, std::string& device_id, std::string& device_name, std::string& model_id)
 {
     device_name = ORCASONAR_FALLBACK;
     model_id    = ORCASONAR_FALLBACK;
 
     try {
         boost::property_tree::ptree tree;
-        std::istringstream           stream(body);
+        std::istringstream stream(body);
         boost::property_tree::read_xml(stream, tree, boost::property_tree::xml_parser::trim_whitespace);
         const auto device = tree.get_child_optional("root.device");
         if (!device)
@@ -218,10 +213,7 @@ bool parse_orcasonar_device_xml(const std::string& body,
     }
 }
 
-bool probe_orcasonar_device_xml(const std::string& location,
-                                std::string&       device_id,
-                                std::string&       device_name,
-                                std::string&       model_id)
+bool probe_orcasonar_device_xml(const std::string& location, std::string& device_id, std::string& device_name, std::string& model_id)
 {
     std::string body;
     return fetch_orcasonar_body(location, body) && parse_orcasonar_device_xml(body, device_id, device_name, model_id);
@@ -385,12 +377,12 @@ private:
         machine["connection_name"] = device_id;
         machine["dev_ip"]          = host + ":" + port;
 
-        machine["dev_signal"]      = "0";
-        machine["connect_type"]    = "lan";
-        machine["bind_state"]      = "free";
-        machine["sec_link"]        = "secure";
-        machine["ssdp_version"]    = "v1";
-        json                       = machine.dump();
+        machine["dev_signal"]   = "0";
+        machine["connect_type"] = "lan";
+        machine["bind_state"]   = "free";
+        machine["sec_link"]     = "secure";
+        machine["ssdp_version"] = "v1";
+        json                    = machine.dump();
         return true;
     }
 
@@ -639,8 +631,7 @@ void OrcaPrinterAgent::set_cloud_agent(std::shared_ptr<ICloudServiceAgent> cloud
     BOOST_LOG_TRIVIAL(info) << "OrcaPrinterAgent::set_cloud_agent: status callback result=" << callback_result;
 }
 
-std::unique_ptr<ICameraSignalingChannel>
-OrcaPrinterAgent::create_camera_signaling_channel(const std::string& dev_id)
+std::unique_ptr<ICameraSignalingChannel> OrcaPrinterAgent::create_camera_signaling_channel(const std::string& dev_id)
 {
     std::lock_guard<std::mutex> lock(state_mutex);
     if (!m_cloud_agent)
@@ -1390,6 +1381,43 @@ int OrcaPrinterAgent::start_send_gcode_to_sdcard(PrintParams params,
     long http_status = 0;
     std::string http_error;
     std::string response_body;
+
+    // check if printer has enough storage
+    Http::get(origin + "/server/files/directory?path=gcodes")
+        .on_complete([&](std::string body, unsigned status) {
+            if (body.empty()) {
+                http_status = 400;
+                http_error  = "Failed to get gcodes directory.";
+            }
+
+            int free = 0;
+
+            nlohmann::json json = nlohmann::json::parse(body);
+            if (json.contains("result")) {
+                json = json["result"];
+                if (json.contains("disk_usage")) {
+                    json = json["disk_usage"];
+                    if (json.contains("free"))
+                        free = json["free"].get<int>();
+                }
+            }
+
+            if (free < file_size) {
+                http_status = 507;
+                http_error  = "Not enough storage on the printer.";
+            }
+        })
+        .on_error([&](std::string body, std::string err, unsigned status) {
+            http_status   = status;
+            http_error    = std::move(err);
+            response_body = std::move(body);
+        })
+        .perform_sync();
+
+    if (http_status >= 400) {
+        BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << " failed with error code: " << http_status << ", " << http_error;
+        return BAMBU_NETWORK_ERR_PRINT_SG_UPLOAD_FTP_FAILED;
+    }
 
     auto http = Http::post(origin + "/server/files/upload");
     if (!params.password.empty())
