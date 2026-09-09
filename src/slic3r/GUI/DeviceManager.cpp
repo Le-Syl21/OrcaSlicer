@@ -370,6 +370,18 @@ NozzleVolumeType convert_to_nozzle_type(const std::string &str)
 wxString MachineObject::get_printer_type_display_str() const
 {
     std::string display_name = DevPrinterConfigUtil::get_printer_display_name(printer_type);
+
+    // Bambu printers use m_resource_file_path + "/printers/" + type_str + ".json", which is a semantic that only works for their profiles.
+    // For any other profile, we can simply consult preset bundle if the model_id exists. 
+    if (display_name.empty()) {
+        for (const auto& [vendor_id, vendor] : GUI::wxGetApp().preset_bundle->vendors) {
+            for (const auto& model : vendor.models) {
+                if (printer_type == model.model_id)
+                    display_name = model.name;
+            }
+        }
+    }
+
     if (!display_name.empty())
         return display_name;
     else if (printer_type == "orcasonar")
