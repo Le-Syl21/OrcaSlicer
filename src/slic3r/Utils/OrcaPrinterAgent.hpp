@@ -127,17 +127,21 @@ public:
     void bump_cloud_generation_for_test() { ++m_cloud_generation; }
 
 protected:
-    // Forward one inbound printer message to on_message_fn (marshalled onto the UI
+    // Forward one inbound printer message to on_message_fn or on_local_message_fn (marshalled onto the UI
     // thread via queue_on_main_fn when set). Body of every connection's MessageHandler.
-    void deliver_to_sink(const std::string& dev_id, const std::string& payload);
+    void deliver_to_sink(const std::string& dev_id, const std::string& payload, bool local);
 
     // Extract OrcaSonar's print.ipcam.stream_mode from LAN reports before they
     // are forwarded to the GUI. The getters below then read this agent-owned state.
     void parse_ipcam_info(const std::string& dev_id, const std::string& payload);
 
-    // LAN has a separate callback in the existing IPrinterAgent contract because the
-    // GUI parses local reports with the "lan" dialect and looks up local machines.
-    void deliver_to_local_sink(const std::string& dev_id, const std::string& payload);
+    // Orca-dialect -> Bambu-dialect compatibility shim for inbound reports: the single
+    // place Orca Protocol JSON is rewritten into the shapes MachineObject::parse_json
+    // already handles, so parse_json needs no Orca-specific changes. Self-contained
+    // (its cache is a function-local static) and deletable together with its call site
+    // once parse_json reads the Orca dialect natively. See the definition for the
+    // per-rule detail. Returns the payload unchanged when no rule applies.
+    std::string merge_capabilities(const std::string& dev_id, const std::string& payload);
 
     // Report the asynchronous LAN connection state using the same callback contract as
     // the other printer agents. The transport result cannot be returned by

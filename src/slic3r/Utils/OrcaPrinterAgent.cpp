@@ -22,11 +22,13 @@
 #include <limits>
 #include <mutex>
 #include <nlohmann/json.hpp>
+#include <nlohmann/json_fwd.hpp>
 #include <random>
 #include <set>
 #include <sstream>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <utility>
 
 #include <boost/property_tree/ptree.hpp>
@@ -218,38 +220,6 @@ bool probe_orcasonar_device_xml(const std::string& location, std::string& device
     std::string body;
     return fetch_orcasonar_body(location, body) && parse_orcasonar_device_xml(body, device_id, device_name, model_id);
 }
-
-// TEMP MOCK: OrcaSonar's push_status doesn't report storage state yet, so
-// DevStorage::ParseV1_0() decodes NO_SDCARD and SelectMachineDialog blocks
-// printing with "No SD card". Force the storage-present markers into every
-// forwarded status document so the printer reports HAS_SDCARD_NORMAL.
-// Remove once the firmware reports real storage state.
-std::string force_sdcard_present(const std::string& payload)
-{
-    nlohmann::json envelope = nlohmann::json::parse(payload, nullptr, false);
-    if (!envelope.is_object())
-        return payload;
-
-    const auto print_it = envelope.find("print");
-    if (print_it == envelope.end() || !print_it->is_object())
-        return payload;
-
-    // DevStorage::ParseV1_0() reads print.sdcard as a bool -> HAS_SDCARD_NORMAL.
-    (*print_it)["sdcard"] = true;
-
-    // MachineObject::parse_home_flag() runs afterwards and re-derives the state
-    // from bits 8-9 of print.home_flag; rewrite them to 01 so it doesn't clobber
-    // the mock back to NO_SDCARD.
-    const auto home_flag_it = print_it->find("home_flag");
-    if (home_flag_it != print_it->end() && home_flag_it->is_number_integer()) {
-        int flag      = home_flag_it->get<int>();
-        flag          = (flag & ~(0x3 << 8)) | (0x1 << 8);
-        *home_flag_it = flag;
-    }
-
-    return envelope.dump();
-}
-
 } // namespace
 
 class OrcaPrinterAgent::OrcaSonarDiscovery
@@ -531,50 +501,142 @@ OrcaMqttConnection* OrcaPrinterAgent::get_appropriate_mqtt_connection(bool is_la
     return cloud ? cloud->get_mqtt_connection() : nullptr;
 }
 
-void OrcaPrinterAgent::deliver_to_sink(const std::string& dev_id, const std::string& payload)
+// ============================================================================
+// Orca-dialect -> Bambu-dialect compatibility shim for inbound printer reports.
+//
+// OrcaSonar and the bridge adapter speak the "Orca Protocol" JSON dialect.
+// MachineObject::parse_json (DeviceManager.cpp) only understands the Bambu
+// dialect. Until the Orca Protocol is formally specified, this function is the
+// ONE place where an inbound Orca-dialect report is rewritten into the Bambu
+// shape parse_json already handles.
+//
+// Rules of this seam:
+//   1. parse_json and the rest of DeviceManager are NOT modified to accommodate
+//      the Orca dialect - every such accommodation is a rule inside this
+//      function.
+//   2. Each rule documents its Orca-dialect source, the Bambu-dialect target
+//      parse_json expects, and the rewrite between them. Rules are independent
+//      and can be removed one at a time as parse_json gains native support.
+//   3. When parse_json reads the Orca dialect directly, this function and the
+//      single call in deliver_to_sink can be deleted, state included. Nothing
+//      else should need to change.
+//
+// It runs on every inbound report, so it stays cheap for payloads it does not
+// touch (substring pre-check, no re-serialize unless something changed) and
+// never throws (non-throwing parse, every field access guarded).
+// ============================================================================
+std::string OrcaPrinterAgent::merge_capabilities(const std::string& dev_id, const std::string& payload)
 {
-    OnMessageFn fn;
-    QueueOnMainFn q;
-    {
-        std::lock_guard<std::mutex> l(state_mutex);
-        fn = on_message_fn;
-        q  = queue_on_main_fn;
+    if (payload.find("get_capabilities") == std::string::npos && payload.find("push_status") == std::string::npos)
+        return payload;
+
+    nlohmann::json envelope = nlohmann::json::parse(payload, nullptr, false);
+    if (!envelope.is_object())
+        return payload;
+
+    // Shim-local state, kept here (not on the class) so deleting this function
+    // removes its storage too. Process-wide and keyed by the globally-unique
+    // dev_id, with its own mutex; C++11 makes the one-time init thread-safe.
+    static std::unordered_map<std::string, double> nozzle_diameter_cache;
+    static std::mutex                              nozzle_diameter_cache_mutex;
+
+    bool modified = false;
+
+    // ---- Rule: nozzle geometry ---------------------------------------------
+    // Orca dialect : info.capabilities.topology.tools[i].nozzle.diameter_mm,
+    //                delivered once in the get_capabilities reply; push_status
+    //                frames carry no nozzle geometry at all.
+    // Bambu dialect: parse_json runs DevNozzleSystemParser::ParseV1_0 only for a
+    //                push_status frame that holds BOTH print.nozzle_diameter and
+    //                print.nozzle_type.
+    // Rewrite      : cache the diameter from the capabilities reply per device,
+    //                then stamp print.nozzle_diameter + a neutral print.nozzle_type
+    //                ("N/A" -> NozzleType::ntUndefine, as MoonrakerPrinterAgent
+    //                does; Klipper has no Bambu nozzle type) onto later push_status
+    //                frames that carry no real nozzle data.
+    const auto info_it = envelope.find("info");
+    const bool is_capabilities_reply = info_it != envelope.end() && info_it->is_object() &&
+                                       info_it->value("command", "") == "get_capabilities";
+
+    if (is_capabilities_reply) {
+        double nozzle_dia  = 0.0;
+        const auto caps_it = info_it->find("capabilities");
+        if (caps_it != info_it->end() && caps_it->is_object()) {
+            const auto topology_it = caps_it->find("topology");
+            if (topology_it != caps_it->end() && topology_it->is_object()) {
+                const auto tools_it = topology_it->find("tools");
+                if (tools_it != topology_it->end() && tools_it->is_array()) {
+                    // First tool with a usable diameter wins: ParseV1_0 keeps a
+                    // single nozzle (id 0).
+                    for (const auto& tool : *tools_it) {
+                        if (!tool.is_object())
+                            continue;
+                        const auto nozzle_it = tool.find("nozzle");
+                        if (nozzle_it == tool.end() || !nozzle_it->is_object())
+                            continue;
+                        const auto dia_it = nozzle_it->find("diameter_mm");
+                        if (dia_it != nozzle_it->end() && dia_it->is_number() && dia_it->get<double>() > 0.0) {
+                            nozzle_dia = dia_it->get<double>();
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        if (nozzle_dia > 0.0) {
+            std::lock_guard<std::mutex> l(nozzle_diameter_cache_mutex);
+            nozzle_diameter_cache[dev_id] = nozzle_dia;
+        }
+        // The capabilities reply itself is forwarded unchanged.
     }
-    BOOST_LOG_TRIVIAL(info) << "Orca diagnostic: delivering cloud message dev_id=" << dev_id << " payload_bytes=" << payload.size()
-                            << " callback=" << (fn ? "set" : "null") << " queue_on_main=" << (q ? "set" : "null");
-    if (!fn) {
-        BOOST_LOG_TRIVIAL(warning) << "Orca diagnostic: dropping cloud message because on_message_fn is not set"
-                                   << " dev_id=" << dev_id;
-        return;
+    else {
+        const auto print_it = envelope.find("print");
+        if (print_it != envelope.end() && print_it->is_object() &&
+            print_it->value("command", "") == "push_status" && !print_it->contains("nozzle_diameter")) {
+
+            double nozzle_dia = 0.0;
+            {
+                std::lock_guard<std::mutex> l(nozzle_diameter_cache_mutex);
+                const auto it = nozzle_diameter_cache.find(dev_id);
+                if (it != nozzle_diameter_cache.end())
+                    nozzle_dia = it->second;
+            }
+            if (nozzle_dia > 0.0) {
+                (*print_it)["nozzle_diameter"] = nozzle_dia;
+                (*print_it)["nozzle_type"]     = "N/A";
+                modified = true;
+            }
+        }
     }
-    if (q)
-        q([fn, dev_id, payload] { fn(dev_id, payload); });
-    else
-        fn(dev_id, payload);
+    // ----------------------------------------------------------------------
+
+    return modified ? envelope.dump() : payload;
 }
 
-void OrcaPrinterAgent::deliver_to_local_sink(const std::string& dev_id, const std::string& payload)
+void OrcaPrinterAgent::deliver_to_sink(const std::string& dev_id, const std::string& payload, bool local)
 {
     parse_ipcam_info(dev_id, payload);
+    std::string merged_payload = merge_capabilities(dev_id, payload);
 
     OnMessageFn fn;
     QueueOnMainFn q;
     {
         std::lock_guard<std::mutex> l(state_mutex);
-        fn = on_local_message_fn;
+        fn = local ? on_local_message_fn : on_message_fn;
         q  = queue_on_main_fn;
     }
-    BOOST_LOG_TRIVIAL(info) << "Orca diagnostic: delivering LAN message dev_id=" << dev_id << " payload_bytes=" << payload.size()
+    BOOST_LOG_TRIVIAL(info) << "Orca diagnostic: delivering " << (local ? "local" : "cloud") << " report payload dev_id=" << dev_id
+                            << " payload=" << merged_payload
                             << " callback=" << (fn ? "set" : "null") << " queue_on_main=" << (q ? "set" : "null");
     if (!fn) {
-        BOOST_LOG_TRIVIAL(warning) << "Orca diagnostic: dropping LAN message because on_local_message_fn is not set"
+        BOOST_LOG_TRIVIAL(warning) << "Orca diagnostic: dropping " << (local ? "local" : "cloud") << " message because on_message_fn is not set"
                                    << " dev_id=" << dev_id;
         return;
     }
     if (q)
-        q([fn, dev_id, payload] { fn(dev_id, payload); });
+        q([fn, dev_id, merged_payload] { fn(dev_id, merged_payload); });
     else
-        fn(dev_id, payload);
+        fn(dev_id, merged_payload);
 }
 
 void OrcaPrinterAgent::dispatch_local_connect(int state, const std::string& dev_id, const std::string& message)
@@ -603,7 +665,7 @@ std::function<void(const std::string&, const std::string&)> OrcaPrinterAgent::ma
 {
     return [this, generation](const std::string& id, const std::string& payload) {
         if (generation == m_lan_generation.load())
-            deliver_to_local_sink(id, payload);
+            deliver_to_sink(id, payload, true);
         else
             BOOST_LOG_TRIVIAL(info) << "Orca diagnostic: dropping stale LAN message generation=" << generation
                                     << " current_generation=" << m_lan_generation.load() << " dev_id=" << id;
@@ -627,7 +689,7 @@ void OrcaPrinterAgent::set_cloud_agent(std::shared_ptr<ICloudServiceAgent> cloud
     // standard sink. message_arrive_fn self-marshals to the UI thread via CallAfter,
     // so being called from the MQTT worker thread is fine.
     const int callback_result = get_orca_cloud_agent()->set_printer_status_callback(
-        [this](std::string dev_id, std::string payload) { deliver_to_sink(dev_id, payload); });
+        [this](std::string dev_id, std::string payload) { deliver_to_sink(dev_id, payload, false); });
     BOOST_LOG_TRIVIAL(info) << "OrcaPrinterAgent::set_cloud_agent: status callback result=" << callback_result;
 }
 

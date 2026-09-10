@@ -28,9 +28,43 @@ TEST_CASE("OrcaPrinterAgent forwards a status payload to on_message_fn", "[OrcaP
     Probe agent("/tmp");
     std::string got_id, got_payload;
     agent.set_on_message_fn([&](std::string id, std::string p){ got_id = std::move(id); got_payload = std::move(p); });
-    agent.deliver_to_sink("dev-1", R"({"print":{"command":"push_status"}})");
+    agent.deliver_to_sink("dev-1", R"({"print":{"command":"push_status"}})", /*local=*/false);
     CHECK(got_id == "dev-1");
     CHECK(got_payload.find("push_status") != std::string::npos);
+}
+
+TEST_CASE("OrcaPrinterAgent stamps the get_capabilities nozzle diameter onto push_status frames", "[OrcaPrinterAgent]") {
+    Probe agent("/tmp");
+    std::string last_payload;
+    agent.set_on_message_fn([&](std::string, std::string p){ last_payload = std::move(p); });
+
+    // Before any capabilities reply, a push_status frame is forwarded untouched.
+    agent.deliver_to_sink("dev-1", R"({"print":{"command":"push_status","mc_percent":10}})", /*local=*/false);
+    CHECK(last_payload.find("nozzle_diameter") == std::string::npos);
+
+    // The get_capabilities reply is forwarded verbatim; its topology nozzle diameter
+    // is cached for the device.
+    agent.deliver_to_sink(
+        "dev-1",
+        R"({"info":{"command":"get_capabilities","capabilities":{"topology":{"tools":[{"id":"T0","nozzle":{"diameter_mm":0.4}}]}}}})",
+        /*local=*/false);
+    CHECK(last_payload.find("\"command\":\"get_capabilities\"") != std::string::npos);
+    CHECK(last_payload.find("\"print\"") == std::string::npos);
+
+    // Later push_status frames for that device get the cached diameter plus a neutral
+    // nozzle_type, so MachineObject::parse_json's legacy nozzle parser can run.
+    agent.deliver_to_sink("dev-1", R"({"print":{"command":"push_status","mc_percent":20}})", /*local=*/false);
+    CHECK(last_payload.find("\"nozzle_diameter\":0.4") != std::string::npos);
+    CHECK(last_payload.find("\"nozzle_type\":\"N/A\"") != std::string::npos);
+
+    // A different device is unaffected.
+    agent.deliver_to_sink("dev-2", R"({"print":{"command":"push_status"}})", /*local=*/false);
+    CHECK(last_payload.find("nozzle_diameter") == std::string::npos);
+
+    // A frame that already carries real nozzle data is not overridden.
+    agent.deliver_to_sink("dev-1", R"({"print":{"command":"push_status","nozzle_diameter":0.6}})", /*local=*/false);
+    CHECK(last_payload.find("\"nozzle_diameter\":0.6") != std::string::npos);
+    CHECK(last_payload.find("N/A") == std::string::npos);
 }
 
 TEST_CASE("OrcaPrinterAgent::parse_lan_endpoint", "[OrcaPrinterAgent]") {
