@@ -5105,7 +5105,7 @@ void TabPrinter::build_fff()
         {
             Line line = { L("Belt tilt"),
                           L("Belt tilt axis and angle, applied as a mesh rotation before "
-                            "slicing.  Also drives bed rendering and support gravity tilt.  "
+                            "slicing. Also drives bed rendering and support gravity tilt. "
                             "Isometric (no distortion); the back-transform inverts it before "
                             "the machine-frame remap.") };
             line.append_option(belt_og->get_option("belt_slice_rotation"));
@@ -5160,7 +5160,7 @@ void TabPrinter::build_fff()
             {
                 Line line = { L("Machine-frame tilt"),
                               L("The machine-frame shear (tan) and scale (1/cos) are derived from "
-                                "the belt tilt angle.  Enable 'Decouple' to set an independent "
+                                "the belt tilt angle. Enable 'Decouple' to set an independent "
                                 "machine-frame angle when the physical gantry tilt differs from "
                                 "the slicing rotation.") };
                 line.append_option(mf->get_option("belt_frame_tilt_decouple"));
