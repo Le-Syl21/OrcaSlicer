@@ -218,7 +218,7 @@ public:
     int del_subscribe(std::vector<std::string> dev_list) override;
     void enable_multi_machine(bool enable) override;
 
-    // The per-printer MQTT socket carries both directions: inbound reports from
+    // The fleet MQTT socket carries both directions: inbound reports from
     // device/<id>/report and commands PUBLISHed to device/<id>/request on this
     // socket. OrcaPrinterAgent registers its message callback here to receive the
     // inbound half; pass an empty fn to clear it before the agent is destroyed.
@@ -229,6 +229,12 @@ public:
     // so it carries the standard apikey + bearer headers and token refresh. Callers
     // that need non-blocking behaviour run it on their own thread.
     int send_printer_command(const std::string& dev_id, const std::string& body);
+
+    // Submit raw sliced G-code to the cloud printer print-jobs endpoint.
+    int send_print_job(const std::string& dev_id,
+                       const std::string& filename,
+                       const std::string& gcode,
+                       bool start = true);
 
     // ========================================================================
     // ICloudServiceAgent Interface Implementation - Settings Synchronization
@@ -377,16 +383,19 @@ public:
         return mqtt_connection.get();
     }
 
-    // Per-printer cloud socket: wss://<api_base_url>/api/v1/printers/<dev_id>/mqtt.
+    // Account-scoped cloud socket: wss://<api_base_url>/api/v1/printers/mqtt.
     // configure_ blocks for the duration of the initial connect attempt, so callers
-    // drive it off the UI thread; teardown_ is synchronous.
-    int         configure_selected_printer_mqtt(const std::string& dev_id);
+    // drive it off the UI thread; teardown_ is synchronous. The dev_id argument is
+    // retained for source compatibility with the printer-agent lifecycle; it does
+    // not participate in endpoint construction.
+    int         configure_selected_printer_mqtt(const std::string& dev_id,
+                                                OrcaMqttConnection::StateHandler state_handler = {});
     void        teardown_selected_printer_mqtt();
-    // Test hook: the wss:// URL of the current per-printer socket ("" when none).
+    // Test hook: the wss:// URL of the current fleet socket ("" when none).
     std::string selected_printer_mqtt_url() const;
 
 private:
-    // Fans one inbound per-printer MQTT message out to printer_status_callback.
+    // Fans one inbound fleet MQTT message out to printer_status_callback.
     void deliver_cloud_message(const std::string& dev_id, const std::string& payload);
 
     // Sync protocol helpers
@@ -412,7 +421,11 @@ private:
 
     // HTTP request helpers
     int http_get(const std::string& path, std::string* response_body, unsigned int* http_code);
-    int http_post(const std::string& path, const std::string& body, std::string* response_body, unsigned int* http_code);
+    int http_post(const std::string& path,
+                  const std::string& body,
+                  std::string* response_body,
+                  unsigned int* http_code,
+                  const std::string& content_type = "application/json");
     int http_put(const std::string& path, const std::string& body, std::string* response_body, unsigned int* http_code);
     int http_delete(const std::string& path, std::string* response_body, unsigned int* http_code);
     std::map<std::string, std::string> data_headers();

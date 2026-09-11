@@ -214,8 +214,8 @@ private:
     OrcaMqttConnection* get_appropriate_mqtt_connection(bool is_lan = true);
     static bool parse_nonnegative_command_id(const std::string& value, int& result);
 
-    // Route one command payload to device/<dev_id>/request on the LAN or the cloud
-    // per-printer connection. The uniform send path for both send_message* overrides.
+    // Route one command payload to device/<dev_id>/request on the LAN or the shared
+    // cloud connection. The uniform send path for both send_message* overrides.
     int route_send(bool is_lan, const std::string& dev_id, const std::string& json_str);
 
     // Callbacks

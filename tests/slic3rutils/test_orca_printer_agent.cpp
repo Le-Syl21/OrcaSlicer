@@ -118,7 +118,7 @@ TEST_CASE("post-connect sequence is subscribe then 4 requests in order", "[OrcaP
 }
 
 // Hidden: spawns the connect worker and attempts a real (failing) connect.
-TEST_CASE("selecting a cloud printer configures the per-printer socket", "[OrcaPrinterAgent][.integration]") {
+TEST_CASE("selecting a cloud printer configures the fleet socket", "[OrcaPrinterAgent][.integration]") {
     auto cloud = std::make_shared<Slic3r::OrcaCloudServiceAgent>("/tmp");
     cloud->set_api_base_url("api.example.com");
     OrcaPrinterAgent agent("/tmp");
@@ -132,10 +132,10 @@ TEST_CASE("selecting a cloud printer configures the per-printer socket", "[OrcaP
         if (!url.empty()) break;
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
-    CHECK(url == "wss://api.example.com/api/v1/printers/printer-uuid-1/mqtt");
+    CHECK(url == "wss://api.example.com/api/v1/printers/mqtt");
 
-    agent.set_user_selected_machine("");     // teardown is synchronous
-    CHECK(cloud->selected_printer_mqtt_url().empty());
+    agent.set_user_selected_machine("");     // selection changes do not tear down the fleet socket
+    CHECK(cloud->selected_printer_mqtt_url() == "wss://api.example.com/api/v1/printers/mqtt");
 }
 
 TEST_CASE("a stale-generation inbound message is dropped", "[OrcaPrinterAgent]") {

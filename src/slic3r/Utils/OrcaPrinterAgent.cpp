@@ -19,11 +19,14 @@
 #include <cstdio>
 #include <condition_variable>
 #include <cmath>
+#include <fstream>
+#include <iterator>
 #include <limits>
 #include <mutex>
 #include <nlohmann/json.hpp>
 #include <nlohmann/json_fwd.hpp>
 #include <random>
+#include <ratio>
 #include <set>
 #include <sstream>
 #include <string>
@@ -1353,24 +1356,48 @@ int OrcaPrinterAgent::set_user_selected_machine(std::string dev_id)
     const uint64_t gen = ++m_cloud_generation;
 
     auto* conn = cloud->get_mqtt_connection();
-    if (!previous.empty() && conn && conn->is_connected())
-        conn->send_request(previous, build_pushing_stop(seq(5)));
-    cloud->teardown_selected_printer_mqtt();
-
-    if (m_cloud_connect_thread.joinable())
-        m_cloud_connect_thread.join(); // teardown_selected_printer_mqtt() above stopped the old cloud conn
-    if (!dev_id.empty()) {
-        m_cloud_connect_thread = std::thread([this, cloud, dev_id, gen] {
-            if (gen != m_cloud_generation.load())
-                return; // superseded before we ran: do not raise a socket nobody tears down
-            if (cloud->configure_selected_printer_mqtt(dev_id) == BAMBU_NETWORK_SUCCESS && gen == m_cloud_generation.load())
-                on_connected(dev_id, cloud->get_mqtt_connection(), gen);
-        });
-    } else {
-        // Deselect: the joined thread may have raised a fresh socket between the
-        // teardown above and the join. stop() is not sticky, so tear down again.
-        cloud->teardown_selected_printer_mqtt();
+    if (!previous.empty()) {
+        cloud->del_subscribe({previous});
+        if (conn && conn->is_connected())
+            conn->send_request(previous, build_pushing_stop(seq(5)));
     }
+
+    // A previous initial-connect worker may still be blocking in start(). Stop it
+    // only when no fleet connection has reached CONNACK; an established fleet
+    // socket survives printer selection changes.
+    if (m_cloud_connect_thread.joinable()) {
+        if (conn && !conn->is_connected())
+            conn->stop();
+        m_cloud_connect_thread.join();
+    }
+
+    if (dev_id.empty())
+        return BAMBU_NETWORK_SUCCESS;
+
+    if (conn && conn->is_running()) {
+        on_connected(dev_id, conn, gen);
+        return BAMBU_NETWORK_SUCCESS;
+    }
+
+    m_cloud_connect_thread = std::thread([this, cloud, dev_id, gen] {
+        if (gen != m_cloud_generation.load())
+            return; // superseded before we ran: do not raise a socket nobody owns
+
+        auto state_handler = [this](bool connected, bool initial) {
+            if (!connected || initial)
+                return;
+            auto* current_cloud = get_orca_cloud_agent();
+            OrcaMqttConnection* current_conn = current_cloud ? current_cloud->get_mqtt_connection() : nullptr;
+            const std::string selected = get_user_selected_machine();
+            if (current_conn && !selected.empty())
+                on_connected(selected, current_conn, m_cloud_generation.load());
+        };
+
+        if (cloud->configure_selected_printer_mqtt(dev_id, std::move(state_handler)) == BAMBU_NETWORK_SUCCESS &&
+            gen == m_cloud_generation.load()) {
+            on_connected(dev_id, cloud->get_mqtt_connection(), gen);
+        }
+    });
     return BAMBU_NETWORK_SUCCESS;
 }
 
@@ -1385,7 +1412,47 @@ AgentInfo OrcaPrinterAgent::get_agent_info_static()
 // ============================================================================
 
 int OrcaPrinterAgent::start_print(PrintParams params, OnUpdateStatusFn update_fn, WasCancelledFn cancel_fn, OnWaitFn wait_fn)
-{ return BAMBU_NETWORK_SUCCESS; }
+{
+    (void) wait_fn;
+
+    if (update_fn)
+        update_fn(PrintingStageCreate, 0, "Preparing...");
+
+    if (cancel_fn && cancel_fn())
+        return BAMBU_NETWORK_ERR_CANCELED;
+
+    auto* cloud = get_orca_cloud_agent();
+    if (!cloud || params.dev_id.empty())
+        return BAMBU_NETWORK_ERR_INVALID_HANDLE;
+
+    const std::string local_path = resolve_local_gcode_path(params);
+    const fs::path source(local_path);
+    boost::filesystem::ifstream input(source, std::ios::in | std::ios::binary);
+    if (!input) {
+        BOOST_LOG_TRIVIAL(error) << "OrcaPrinterAgent: G-code file does not exist: " << local_path;
+        return BAMBU_NETWORK_ERR_FILE_NOT_EXIST;
+    }
+
+    const std::string gcode((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+    if (input.bad()) {
+        BOOST_LOG_TRIVIAL(error) << "OrcaPrinterAgent: failed to read G-code file: " << local_path;
+        return BAMBU_NETWORK_ERR_PRINT_WR_POST_TASK_FAILED;
+    }
+    if (cancel_fn && cancel_fn())
+        return BAMBU_NETWORK_ERR_CANCELED;
+
+    if (update_fn)
+        update_fn(PrintingStageUpload, 0, "Uploading G-code...");
+
+    const int result = cloud->send_print_job(params.dev_id, remote_gcode_name(params), gcode, true);
+    if (result != BAMBU_NETWORK_SUCCESS)
+        return result;
+
+    if (update_fn)
+        update_fn(PrintingStageFinished, 100, "Print started");
+
+    return BAMBU_NETWORK_SUCCESS;
+}
 
 int OrcaPrinterAgent::start_local_print_with_record(PrintParams params,
                                                     OnUpdateStatusFn update_fn,

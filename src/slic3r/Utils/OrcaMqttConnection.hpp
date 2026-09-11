@@ -23,7 +23,7 @@
 namespace Slic3r {
 
 // Minimal MQTT 3.1.1 codec + WebSocket transport (ws:// and wss://), shared by the
-// LAN (OrcaSonar) and cloud (per-printer) printer connections. Both PUBLISH
+// LAN (OrcaSonar) and cloud (fleet) printer connections. Both PUBLISH
 // commands to device/<id>/request and SUBSCRIBE device/<id>/report; Config is the
 // only per-transport difference.
 class OrcaMqttConnection
