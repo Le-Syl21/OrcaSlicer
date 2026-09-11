@@ -1913,6 +1913,8 @@ void TreeSupport::generate()
                 if (!belt_ext_layers.empty()) {
                     auto &sl_vec = m_object->support_layers();
                     sl_vec.insert(sl_vec.begin(), belt_ext_layers.begin(), belt_ext_layers.end());
+                    for (size_t i = 0; i < sl_vec.size(); ++i)
+                        sl_vec[i]->set_id(i);
                 }
             }
         }
