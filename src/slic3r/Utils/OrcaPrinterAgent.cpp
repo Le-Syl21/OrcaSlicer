@@ -1411,6 +1411,19 @@ AgentInfo OrcaPrinterAgent::get_agent_info_static()
 // Print Job Operations - All Stubs
 // ============================================================================
 
+// Orchestrates the cloud print workflow: upload the sliced G-code straight to R2
+// via a presigned URL (upload_gcode_via_cloud), then finalize over HTTP
+// (start_cloud_print_job). The finalize call is what actually gets the file to
+// the printer: the gateway HEAD-verifies the R2 object, then relays
+// print.project_file to OrcaSonar over the gateway's OWN cloud relay connection -
+// not this agent's MQTT session. See CLOUD_PRINT_JOB_MQTT_DESIGN.md for the
+// MQTT-native alternative (publishing print.project_file directly over this
+// agent's own cloud connection) and why it isn't used yet.
+//
+// This deliberately does NOT go through start_sdcard_print/print.gcode_file:
+// that command is the generic "start this file already on the printer" primitive
+// (also used by the LAN start_local_print path, and meant to stay that way as it
+// grows params like filament mapping), and has no download-awareness to give it.
 int OrcaPrinterAgent::start_print(PrintParams params, OnUpdateStatusFn update_fn, WasCancelledFn cancel_fn, OnWaitFn wait_fn)
 {
     (void) wait_fn;
@@ -1426,27 +1439,32 @@ int OrcaPrinterAgent::start_print(PrintParams params, OnUpdateStatusFn update_fn
         return BAMBU_NETWORK_ERR_INVALID_HANDLE;
 
     const std::string local_path = resolve_local_gcode_path(params);
-    const fs::path source(local_path);
-    boost::filesystem::ifstream input(source, std::ios::in | std::ios::binary);
-    if (!input) {
+    boost::system::error_code ec;
+    if (!fs::exists(local_path, ec) || !fs::is_regular_file(local_path, ec)) {
         BOOST_LOG_TRIVIAL(error) << "OrcaPrinterAgent: G-code file does not exist: " << local_path;
         return BAMBU_NETWORK_ERR_FILE_NOT_EXIST;
     }
 
-    const std::string gcode((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
-    if (input.bad()) {
-        BOOST_LOG_TRIVIAL(error) << "OrcaPrinterAgent: failed to read G-code file: " << local_path;
-        return BAMBU_NETWORK_ERR_PRINT_WR_POST_TASK_FAILED;
-    }
     if (cancel_fn && cancel_fn())
         return BAMBU_NETWORK_ERR_CANCELED;
 
     if (update_fn)
         update_fn(PrintingStageUpload, 0, "Uploading G-code...");
 
-    const int result = cloud->send_print_job(params.dev_id, remote_gcode_name(params), gcode, true);
+    std::string job_id;
+    int result = cloud->upload_gcode_via_cloud(params.dev_id, local_path, &job_id, update_fn, cancel_fn);
     if (result != BAMBU_NETWORK_SUCCESS)
         return result;
+
+    if (cancel_fn && cancel_fn())
+        return BAMBU_NETWORK_ERR_CANCELED;
+
+    if (update_fn)
+        update_fn(PrintingStageSending, 0, "Starting print...");
+
+    const int start_rc = cloud->start_cloud_print_job(params.dev_id, job_id, remote_gcode_name(params), /*start=*/true);
+    if (start_rc != BAMBU_NETWORK_SUCCESS)
+        return start_rc;
 
     if (update_fn)
         update_fn(PrintingStageFinished, 100, "Print started");

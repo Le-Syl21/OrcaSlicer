@@ -230,11 +230,29 @@ public:
     // that need non-blocking behaviour run it on their own thread.
     int send_printer_command(const std::string& dev_id, const std::string& body);
 
-    // Submit raw sliced G-code to the cloud printer print-jobs endpoint.
-    int send_print_job(const std::string& dev_id,
-                       const std::string& filename,
-                       const std::string& gcode,
-                       bool start = true);
+    // Upload sliced G-code to the cloud printer's print job storage: requests a
+    // short-lived presigned URL (POST print-jobs/uploads), then PUTs the file
+    // straight to R2 with that URL. Does not start the print or wait for
+    // OrcaSonar to download it - see OrcaPrinterAgent::start_print/start_sdcard_print
+    // for the MQTT hand-off that follows. *job_id receives the id to correlate
+    // with that hand-off; update_fn receives upload progress via Http's on_progress.
+    int upload_gcode_via_cloud(const std::string& dev_id,
+                               const std::string& local_gcode_path,
+                               std::string* job_id,
+                               OnUpdateStatusFn update_fn,
+                               WasCancelledFn cancel_fn);
+
+    // Finalize a presigned print-job upload (step 3 of 3): POST
+    // print-jobs/<job_id>/start. The gateway HEAD-verifies the object landed in
+    // R2, then relays a print.project_file command (download URL + filename +
+    // start) to the printer over the gateway's OWN cloud relay connection to
+    // OrcaSonar - NOT this agent's MQTT session. See
+    // CLOUD_PRINT_JOB_MQTT_DESIGN.md for the MQTT-native alternative this
+    // stands in for until the gap documented there is closed.
+    int start_cloud_print_job(const std::string& dev_id,
+                              const std::string& job_id,
+                              const std::string& filename,
+                              bool start = true);
 
     // ========================================================================
     // ICloudServiceAgent Interface Implementation - Settings Synchronization

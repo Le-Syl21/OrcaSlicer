@@ -1127,21 +1127,113 @@ int OrcaCloudServiceAgent::send_printer_command(const std::string& dev_id, const
                : BAMBU_NETWORK_ERR_CONNECT_FAILED;
 }
 
-int OrcaCloudServiceAgent::send_print_job(const std::string& dev_id,
-                                          const std::string& filename,
-                                          const std::string& gcode,
-                                          bool start)
+int OrcaCloudServiceAgent::upload_gcode_via_cloud(const std::string& dev_id,
+                                                  const std::string& local_gcode_path,
+                                                  std::string* job_id,
+                                                  OnUpdateStatusFn update_fn,
+                                                  WasCancelledFn cancel_fn)
 {
-    if (dev_id.empty() || filename.empty() || !is_user_login())
+    if (dev_id.empty() || local_gcode_path.empty() || !is_user_login())
+        return BAMBU_NETWORK_ERR_INVALID_HANDLE;
+    if (cancel_fn && cancel_fn())
+        return BAMBU_NETWORK_ERR_CANCELED;
+
+    // Step 1: POST print-jobs/uploads -> a short-lived presigned R2 PUT URL. No
+    // metadata rides this request; filename/start are only relevant to the HTTP
+    // .../start finalize route, which this MQTT-driven flow does not call.
+    const std::string uploads_path = std::string(ORCA_CLOUD_PRINTER) + "/" + Http::url_encode(dev_id) + "/print-jobs/uploads";
+    std::string response;
+    unsigned int http_code = 0;
+    int result = http_post(uploads_path, "{}", &response, &http_code);
+    if (result != BAMBU_NETWORK_SUCCESS || http_code < 200 || http_code >= 300) {
+        BOOST_LOG_TRIVIAL(warning) << "OrcaCloudServiceAgent: print-jobs/uploads failed http_code=" << http_code;
+        return BAMBU_NETWORK_ERR_CONNECT_FAILED;
+    }
+
+    std::string upload_job_id;
+    std::string upload_url;
+    try {
+        const nlohmann::json j = nlohmann::json::parse(response);
+        upload_job_id = j.value("job_id", "");
+        upload_url    = j.value("upload_url", "");
+    } catch (const std::exception& e) {
+        BOOST_LOG_TRIVIAL(error) << "OrcaCloudServiceAgent: failed to parse print-jobs/uploads response: " << e.what();
+        return BAMBU_NETWORK_ERR_CONNECT_FAILED;
+    }
+    if (upload_job_id.empty() || upload_url.empty()) {
+        BOOST_LOG_TRIVIAL(error) << "OrcaCloudServiceAgent: print-jobs/uploads response missing job_id/upload_url";
+        return BAMBU_NETWORK_ERR_CONNECT_FAILED;
+    }
+
+    if (cancel_fn && cancel_fn())
+        return BAMBU_NETWORK_ERR_CANCELED;
+
+    // Step 2: PUT the G-code straight to R2 with the one-time URL from step 1. This
+    // is a scoped, PUT-only, short-TTL capability with no bearer token of its own,
+    // so it bypasses http_put (which always prefixes api_base_url and attaches the
+    // cloud session's Authorization header - neither belongs on an R2 PUT).
+    bool canceled = false;
+    unsigned put_status = 0;
+    std::string put_error;
+    Http::put(upload_url)
+        .tls_verify(true)
+        .header("Content-Type", "text/x.gcode")
+        .set_put_body(boost::filesystem::path(local_gcode_path))
+        .timeout_connect(5)
+        .timeout_max(300) // large G-code over a slow link
+        .on_progress([&](Http::Progress progress, bool& cancel) {
+            if (cancel_fn && cancel_fn()) {
+                cancel   = true;
+                canceled = true;
+                return;
+            }
+            if (update_fn && progress.ultotal > 0) {
+                const int percent = static_cast<int>((progress.ulnow * 100) / progress.ultotal);
+                update_fn(PrintingStageUpload, percent, "Uploading...");
+            }
+        })
+        .on_complete([&](std::string, unsigned status) { put_status = status; })
+        .on_error([&](std::string, std::string err, unsigned status) {
+            put_status = status;
+            put_error  = std::move(err);
+        })
+        .perform_sync();
+
+    if (canceled)
+        return BAMBU_NETWORK_ERR_CANCELED;
+    if (put_status < 200 || put_status >= 300) {
+        BOOST_LOG_TRIVIAL(warning) << "OrcaCloudServiceAgent: R2 upload failed status=" << put_status << " error=" << put_error;
+        return BAMBU_NETWORK_ERR_PRINT_SG_UPLOAD_FTP_FAILED;
+    }
+
+    if (job_id)
+        *job_id = std::move(upload_job_id);
+    return BAMBU_NETWORK_SUCCESS;
+}
+
+int OrcaCloudServiceAgent::start_cloud_print_job(const std::string& dev_id,
+                                                 const std::string& job_id,
+                                                 const std::string& filename,
+                                                 bool start)
+{
+    if (dev_id.empty() || job_id.empty() || !is_user_login())
         return BAMBU_NETWORK_ERR_INVALID_HANDLE;
 
-    const std::string path = std::string(ORCA_CLOUD_PRINTER) + "/" + Http::url_encode(dev_id) + "/print-jobs?filename=" +
-                             Http::url_encode(filename) + "&start=" + (start ? "true" : "false");
+    nlohmann::json body;
+    if (!filename.empty())
+        body["filename"] = filename;
+    body["start"] = start;
+
+    const std::string path = std::string(ORCA_CLOUD_PRINTER) + "/" + Http::url_encode(dev_id) + "/print-jobs/" +
+                             Http::url_encode(job_id) + "/start";
+    std::string response;
     unsigned int http_code = 0;
-    const int result = http_post(path, gcode, nullptr, &http_code, "text/plain");
-    if (result != BAMBU_NETWORK_SUCCESS)
-        return result;
-    return http_code >= 200 && http_code < 300 ? BAMBU_NETWORK_SUCCESS : BAMBU_NETWORK_ERR_CONNECT_FAILED;
+    const int result = http_post(path, body.dump(), &response, &http_code);
+    if (result != BAMBU_NETWORK_SUCCESS || http_code < 200 || http_code >= 300) {
+        BOOST_LOG_TRIVIAL(warning) << "OrcaCloudServiceAgent: print-jobs/" << job_id << "/start failed http_code=" << http_code;
+        return BAMBU_NETWORK_ERR_CONNECT_FAILED;
+    }
+    return BAMBU_NETWORK_SUCCESS;
 }
 
 void OrcaCloudServiceAgent::enable_multi_machine(bool enable)
