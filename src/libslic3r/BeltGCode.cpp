@@ -15,6 +15,7 @@ void BeltGCode::init_belt_writer(Print &print, bool is_bbl_printers)
     // Axis remap and build volume max are set by base GCode after init_belt_writer returns.
     belt_writer->set_belt_back_transform(print.config());
     belt_writer->set_machine_frame_transform(print.config());
+    belt_writer->set_xy_offset(m_gcode_offset.x(), m_gcode_offset.y());
     m_writer = std::move(belt_writer);
 }
 
