@@ -2961,10 +2961,9 @@ void GCode::_do_export(Print& print, GCodeOutputStream &file, ThumbnailsGenerato
     m_fan_mover.release();
     m_ordering_cache.clear();
 
-    m_writer->set_is_bbl_machine(is_bbl_printers);
-
     // Belt printer: initialize belt-specific writer via virtual hook.
-    this->init_belt_writer(print, is_bbl_printers);
+    this->init_belt_writer(print);
+    m_writer->set_is_bbl_machine(is_bbl_printers);
 
     // Standalone axis remap (works with or without belt mode).
     // Sync the writer's remap state to the current export UNCONDITIONALLY — even at

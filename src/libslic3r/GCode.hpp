@@ -376,7 +376,7 @@ protected:
 
     // Virtual hooks for belt printer subclass (BeltGCode).
     // No-ops in base GCode; overridden in BeltGCode.
-    virtual void init_belt_writer(Print &print, bool is_bbl_printers) {}
+    virtual void init_belt_writer(Print &print) {}
     virtual void write_belt_header(GCodeOutputStream &file, const Print &print) {}
     virtual void on_set_origin(const PrintObject *obj, const Point &inst_shift) {}
     virtual bool should_disable_arc_fitting() const { return false; }
