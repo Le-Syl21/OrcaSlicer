@@ -5342,8 +5342,7 @@ LayerResult GCode::process_belt_brim_layer(
     // skip these layers entirely.
     {
         char buf[64];
-        sprintf(buf, ";%s%g\n", GCodeProcessor::reserved_tag(GCodeProcessor::ETags::Layer_Change).c_str(), print_z);
-        gcode += buf;
+        gcode += ";" + GCodeProcessor::reserved_tag(GCodeProcessor::ETags::Layer_Change) + "\n";
         sprintf(buf, ";Z:%g\n", print_z);
         gcode += buf;
         const float band_height = float(height);
