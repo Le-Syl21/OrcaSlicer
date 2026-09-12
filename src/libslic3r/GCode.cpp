@@ -5374,7 +5374,12 @@ LayerResult GCode::process_belt_brim_layer(
             print.config().layer_change_gcode.value, m_writer->filament()->id(), &config) + "\n";
     }
 
-    gcode += this->emit_belt_brim_bands(print, layers, single_object_instance_idx);
+    // Objects sharing this apron Z may use different brim filaments; print each in its own tool.
+    for (const unsigned int brim_extruder : layer_tools.extruders) {
+        if (m_writer->filament() == nullptr || m_writer->filament()->id() != brim_extruder)
+            gcode += this->set_extruder(brim_extruder, print_z);
+        gcode += this->emit_belt_brim_bands(print, layers, single_object_instance_idx, brim_extruder);
+    }
 
     result.gcode = std::move(gcode);
     return result;
@@ -5389,7 +5394,7 @@ LayerResult GCode::process_belt_brim_layer(
 std::string GCode::emit_belt_brim_bands(const Print                     &print,
                                         const std::vector<LayerToPrint> &layers,
                                         const size_t                     single_object_instance_idx,
-                                        const std::optional<unsigned int> extruder_id)
+                                        const unsigned int               extruder_id)
 {
     std::string gcode;
     for (const LayerToPrint &ltp : layers) {
@@ -5397,8 +5402,8 @@ std::string GCode::emit_belt_brim_bands(const Print                     &print,
         if (band == nullptr || band->fills.empty() || ltp.original_object == nullptr)
             continue;
         const PrintObject &object = *ltp.original_object;
-        // No filter prints every band; belt_brim_filament() is 1-based.
-        if (extruder_id && (! object.has_belt_brim() || static_cast<unsigned int>(object.belt_brim_filament() - 1) != *extruder_id))
+        // belt_brim_filament() is 1-based.
+        if (! object.has_belt_brim() || static_cast<unsigned int>(object.belt_brim_filament() - 1) != extruder_id)
             continue;
         // Speeds, flow and retraction all read m_config.
         m_config.apply(print.default_region_config());
