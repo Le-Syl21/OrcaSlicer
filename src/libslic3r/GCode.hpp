@@ -418,13 +418,15 @@ protected:
         const bool                       last_layer,
         const size_t                     single_object_instance_idx);
 
-    // Emit the apron bands carried by these layers.  Called from both the brim-only
-    // branch and the ordinary path, since a band's print_z can coincide with another
-    // object's layer on a multi-object belt.
+    // Emit the apron bands carried by these layers, only those whose brim filament is
+    // extruder_id (0-based) when given.  Called from both the brim-only branch and the
+    // ordinary path, since a band's print_z can coincide with another object's layer on a
+    // multi-object belt.
     std::string emit_belt_brim_bands(
         const Print                     &print,
         const std::vector<LayerToPrint> &layers,
-        const size_t                     single_object_instance_idx);
+        const size_t                     single_object_instance_idx,
+        const std::optional<unsigned int> extruder_id = std::nullopt);
 
     LayerResult process_layer(
         const Print                     &print,

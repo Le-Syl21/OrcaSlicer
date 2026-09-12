@@ -5388,7 +5388,8 @@ LayerResult GCode::process_belt_brim_layer(
 // object layer, takes the ordinary path, and the band would be silently dropped.
 std::string GCode::emit_belt_brim_bands(const Print                     &print,
                                         const std::vector<LayerToPrint> &layers,
-                                        const size_t                     single_object_instance_idx)
+                                        const size_t                     single_object_instance_idx,
+                                        const std::optional<unsigned int> extruder_id)
 {
     std::string gcode;
     for (const LayerToPrint &ltp : layers) {
@@ -5396,6 +5397,9 @@ std::string GCode::emit_belt_brim_bands(const Print                     &print,
         if (band == nullptr || band->fills.empty() || ltp.original_object == nullptr)
             continue;
         const PrintObject &object = *ltp.original_object;
+        // No filter prints every band; belt_brim_filament() is 1-based.
+        if (extruder_id && (! object.has_belt_brim() || static_cast<unsigned int>(object.belt_brim_filament() - 1) != *extruder_id))
+            continue;
         // Speeds, flow and retraction all read m_config.
         m_config.apply(print.default_region_config());
         m_config.apply(object.config(), true);
@@ -6623,39 +6627,11 @@ LayerResult GCode::process_layer(
     std::set<std::pair<size_t, size_t>> belt_brim_emitted;
 
     // Emit every ORDINARY-layer apron band (belt_brim_prologue band coinciding with an
-    // object/support layer) whose brim filament is this pass's extruder.  Mirrors
-    // emit_belt_brim_bands() per band, but filtered to one brim filament so each band
+    // object/support layer) whose brim filament is this pass's extruder, so each band
     // prints in the correct tool's pass (Finding B).  extruder_id is 0-based (the
-    // reindexed tool domain); belt_brim_filament() is 1-based, so subtract one.
+    // reindexed tool domain).
     auto emit_belt_brim_for_extruder = [this, &print, &layers, single_object_instance_idx](unsigned int extruder_id) -> std::string {
-        std::string gc;
-        for (const LayerToPrint &ltp : layers) {
-            const BeltBrimBand *band = ltp.belt_brim_band;
-            if (band == nullptr || band->fills.empty() || ltp.original_object == nullptr)
-                continue;
-            const PrintObject &object = *ltp.original_object;
-            if (! object.has_belt_brim() || (unsigned int)(object.belt_brim_filament() - 1) != extruder_id)
-                continue;
-            // Speeds, flow and retraction all read m_config.
-            m_config.apply(print.default_region_config());
-            m_config.apply(object.config(), true);
-            const size_t i_begin = single_object_instance_idx == size_t(-1) ? 0 : single_object_instance_idx;
-            const size_t i_end   = single_object_instance_idx == size_t(-1) ? object.instances().size()
-                                                                           : single_object_instance_idx + 1;
-            for (size_t i = i_begin; i < i_end && i < object.instances().size(); ++ i) {
-                // Band geometry is object-local, like the object's own extrusions.
-                const Point &offset = object.instances()[i].shift;
-                this->set_origin(unscale(offset));
-                this->on_set_origin(&object, offset);
-                m_avoid_crossing_perimeters.use_external_mp();
-                for (const ExtrusionEntity *ee : band->fills.entities)
-                    if (ee != nullptr)
-                        gc += this->extrude_entity(*ee, "brim", NOZZLE_CONFIG(support_speed));
-                m_avoid_crossing_perimeters.use_external_mp(false);
-                m_avoid_crossing_perimeters.disable_once();
-            }
-        }
-        return gc;
+        return this->emit_belt_brim_bands(print, layers, single_object_instance_idx, extruder_id);
     };
 
     for (unsigned int extruder_id : layer_tools.extruders)
