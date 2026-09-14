@@ -16,41 +16,6 @@
 #include <cstdint>
 #include "ICameraSignalingChannel.hpp"
 
-#if 1
-
-struct OrcaProtocol
-{
-    enum CameraStreamMode { http, http_snapshot, rtsp, webrtc };
-    struct Capabilities {
-        bool has_ams;
-        struct CameraInfo {
-            CameraStreamMode available_modes;
-            std::string url;
-        };
-
-        std::vector<CameraInfo> cameras;
-
-        bool toolchanger;
-        int nozzle_count;
-    };
-
-    struct AMSInfo {
-        int slot_count;
-        std::vector<std::string> color_info;
-        std::vector<std::string> filament_id;
-    };
-
-    AMSInfo ams_info;
-
-    struct Status {
-        std::vector<int> nozzle_temps;
-        int bed_temp;
-        int chamber_temp;  
-    };
-};
-
-#endif
-
 namespace Slic3r {
 
 class ICloudServiceAgent;
@@ -377,6 +342,16 @@ public:
      * Populates the MachineObject's DevFilaSystem with fetched filament data.
      */
     virtual bool fetch_filament_info(std::string dev_id, FilamentSyncMode sync_mode = FilamentSyncMode::pull) { return false; }
+
+    /**
+     * Translate one filament id across the printer boundary.
+     *
+     * Orca content-addresses every system filament; a printer, its AMS and its vendor cloud
+     * know only that vendor's own catalog ids. An agent whose printers already speak Orca's
+     * ids leaves them alone, and so does an id with no mapping.
+     */
+    virtual std::string to_orca_filament_id(const std::string& printer_filament_id) const { return printer_filament_id; }
+    virtual std::string from_orca_filament_id(const std::string& orca_filament_id) const { return orca_filament_id; }
 
     /**
      * Get the current camera stream URL for this agent's active machine.

@@ -11,6 +11,8 @@
 #include <sstream>
 #include <thread>
 
+using json = nlohmann::json;
+
 namespace Slic3r {
 
 namespace {

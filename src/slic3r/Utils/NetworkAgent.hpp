@@ -184,6 +184,8 @@ public:
     CameraStreamMode get_camera_stream_mode() const;
     std::string get_local_camera_stream_url() const;
     std::unique_ptr<ICameraSignalingChannel> create_camera_signaling_channel(const std::string& dev_id);
+    std::string to_orca_filament_id(const std::string& printer_filament_id) const;
+    std::string from_orca_filament_id(const std::string& orca_filament_id) const;
     int request_bind_ticket(std::string* ticket);
     int get_hms_snapshot(std::string dev_id, std::string file_name, std::function<void(std::string, int)> callback);
 
