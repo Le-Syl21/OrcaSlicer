@@ -7,6 +7,7 @@
 #include "DeviceManager.hpp"
 #include "DeviceCore/DevConfigUtil.h"
 #include "slic3r/Utils/NetworkAgent.hpp"
+#include "slic3r/Utils/NetworkAgentFactory.hpp"
 #include "libslic3r/Thread.hpp"
 #include "libslic3r/AppConfig.hpp"
 #include "I18N.hpp"
@@ -195,8 +196,6 @@ void MediaPlayCtrl::SetMachineObject(MachineObject* obj)
         m_agent_camera_url = url;
         m_url       = from_u8(url);
         if (!changed) {
-            if (m_last_state == MEDIASTATE_IDLE && IsEnabled() && !m_web_user_stopped)
-                Play();
             return;
         }
         // A genuine machine/URL switch: not a failure, so drop any pending
@@ -207,8 +206,6 @@ void MediaPlayCtrl::SetMachineObject(MachineObject* obj)
         m_next_retry   = wxDateTime();
         if (m_last_state != MEDIASTATE_IDLE)
             Stop(" ");
-        if (IsEnabled())
-            Play();
         return;
     }
     case CameraStreamMode::webrtc: {
@@ -222,15 +219,11 @@ void MediaPlayCtrl::SetMachineObject(MachineObject* obj)
         m_url.clear();
         m_agent_camera_url.clear();
         if (!changed) {
-            if (m_last_state == MEDIASTATE_IDLE && IsEnabled() && !m_web_user_stopped)
-                Play();
             return;
         }
         m_web_user_stopped = false;
         if (m_last_state != MEDIASTATE_IDLE)
             Stop(" ");
-        if (IsEnabled())
-            Play();
         return;
     }
     default:
@@ -266,8 +259,6 @@ void MediaPlayCtrl::SetMachineObject(MachineObject* obj)
     }
     Enable(obj && obj->is_info_ready() && obj->m_push_count > 0);
     if (machine == m_machine) {
-        if (m_last_state == MEDIASTATE_IDLE && IsEnabled())
-            Play();
         return;
     }
     m_machine = machine;
@@ -410,7 +401,12 @@ void MediaPlayCtrl::Play()
         m_webrtc_epoch = m_webrtc_ctrl->epoch();
         return;
     }
-    default:
+    default: // assumed to be CameraStreamMode::none
+        NetworkAgent* agent = wxGetApp().getAgent();
+        if (agent && agent->get_printer_agent()->get_agent_info().id != BBL_PRINTER_AGENT_ID) {
+            Stop(_L("Camera not available"));
+            return;
+        }
         break;
     }
 
@@ -586,12 +582,9 @@ void MediaPlayCtrl::Stop(wxString const &msg, wxString const &msg2)
                 SetStatus(msg);
             else
                 SetStatus(_L("Video Stopped."), false);
-            // SetMachineObject re-drives Play() on every device refresh (~1s).
-            // This branch returns before the legacy back-off below, so on a real
-            // failure it has to arm m_next_retry itself or the stream restarts
-            // once a second forever. Escalate 5s..30s; m_failed_retry is cleared
-            // on success (onStateChanged) and on a deliberate switch
-            // (SetMachineObject), and a manual play via TogglePlay resets both.
+            // Keep retries bounded for an explicit or retry-driven playback attempt.
+            // m_failed_retry is cleared on success (onStateChanged) and on a deliberate
+            // machine switch (SetMachineObject); manual playback via TogglePlay resets it.
             if (m_failed_code != 0) {
                 const bool auto_retry = wxGetApp().app_config->get("liveview", "auto_retry") != "false";
                 ++m_failed_retry;
@@ -935,9 +928,8 @@ void MediaPlayCtrl::on_show_hide(wxShowEvent &evt)
     evt.Skip();
     if (m_isBeingDeleted) return;
     m_failed_retry = 0;
-    if (m_next_retry.IsValid()) // Try open 2 seconds later, to avoid quick play/stop
-        m_next_retry = wxDateTime::Now() + wxTimeSpan::Seconds(2);
-    IsShownOnScreen() ? Play() : Stop();
+    if (!IsShownOnScreen())
+        Stop();
 }
 
 void MediaPlayCtrl::media_proc()
