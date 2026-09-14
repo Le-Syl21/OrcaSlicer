@@ -14,6 +14,7 @@
 #include <vector>
 #include <functional>
 #include <cstdint>
+#include "ICameraSignalingChannel.hpp"
 
 #if 1
 
@@ -246,7 +247,7 @@ public:
     virtual std::string get_user_selected_machine() = 0;
 
     /**
-     * Update the selected machine preference.
+     * Update the selected cloud machine preference.
      */
     virtual int set_user_selected_machine(std::string dev_id) = 0;
 
@@ -382,6 +383,15 @@ public:
      * Only meaningful when get_camera_stream_mode() returns an HTTP or RTSP mode.
      */
     virtual std::string get_camera_url() const { return {}; }
+
+    // Optional native camera signaling. Plugin agents retain the default
+    // nullptr until a plugin-facing WebRTC contract is defined.
+    virtual std::unique_ptr<ICameraSignalingChannel>
+    create_camera_signaling_channel(const std::string& dev_id)
+    {
+        (void) dev_id;
+        return nullptr;
+    }
 };
 
 } // namespace Slic3r

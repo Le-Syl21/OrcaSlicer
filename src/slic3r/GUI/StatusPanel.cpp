@@ -2308,8 +2308,8 @@ void StatusPanel::update_camera_state(MachineObject* obj)
 
     auto agent = wxGetApp().getAgent();
     const auto camera_mode = agent ? agent->get_camera_stream_mode() : CameraStreamMode::none;
-    const bool has_printer_webcam = camera_mode == CameraStreamMode::http || camera_mode == CameraStreamMode::http_snapshot;
-    if (has_printer_webcam) {
+    const bool use_webview = camera_mode == CameraStreamMode::http_snapshot;
+    if (use_webview) {
         //m_camera_switch_button->Hide();
         if (!m_custom_camera_view->IsShown()) {
             // why: do not reload the WebView URL per tick, or redirects can cause a reload loop.
@@ -2317,10 +2317,14 @@ void StatusPanel::update_camera_state(MachineObject* obj)
             m_custom_camera_view->Show();
             m_media_ctrl->Hide();
         }
-    } else if (m_custom_camera_view->IsShown()) {
-        m_custom_camera_view->Hide();
+    } else {
+        if (m_custom_camera_view->IsShown()) {
+            m_custom_camera_view->Hide();
+            // Stop the snapshot WebView before switching to native playback
+            // or leaving the camera mode.
+            m_media_play_ctrl->StopWebStream();
+        }
         m_media_ctrl->Show();
-        m_media_play_ctrl->StopWebStream();
     }
 
     //sdcard
@@ -2354,7 +2358,7 @@ void StatusPanel::update_camera_state(MachineObject* obj)
         m_last_recording = obj->is_recording() ? 1 : 0;
     }
 
-    if (has_printer_webcam) {
+    if (use_webview) {
         if (m_bitmap_recording_img->IsShown()) {
             m_bitmap_recording_img->Hide();
             m_panel_monitoring_title->Layout();
@@ -2417,7 +2421,7 @@ void StatusPanel::update_camera_state(MachineObject* obj)
         m_camera_popup->update(show_vcamera);
     }
 
-    m_setting_button->Show(!has_printer_webcam);
+    m_setting_button->Show(!use_webview);
 }
 
 StatusPanel::StatusPanel(wxWindow *parent, wxWindowID id, const wxPoint &pos, const wxSize &size, long style, const wxString &name)

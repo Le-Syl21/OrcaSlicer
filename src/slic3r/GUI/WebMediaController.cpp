@@ -52,10 +52,13 @@ void WebMediaController::Play()
                 "refreshCameraFrame();"
                 "setInterval(refreshCameraFrame,200);"
                 "</script></body></html>";
+        m_webview->SetPage(html, url);
     } else {
-        html += " src=\"" + url + "\"></body></html>";
+        // Load MJPEG streams as the top-level document.  Some embedded WebView
+        // backends buffer a multipart stream when it is used as an <img> resource,
+        // which introduces noticeable live-view latency.
+        m_webview->LoadURL(url);
     }
-    m_webview->SetPage(html, url);
 }
 
 void WebMediaController::Stop()

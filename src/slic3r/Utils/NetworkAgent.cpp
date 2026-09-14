@@ -925,8 +925,14 @@ std::string NetworkAgent::get_user_selected_machine()
 
 int NetworkAgent::set_user_selected_machine(std::string dev_id)
 {
-    if (m_printer_agent)
-        return m_printer_agent->set_user_selected_machine(dev_id);
+    BOOST_LOG_TRIVIAL(info) << "NetworkAgent::set_user_selected_machine: dev_id=" << dev_id
+                            << " printer_agent=" << (m_printer_agent ? m_printer_agent->get_agent_info().id : "<null>");
+    if (m_printer_agent) {
+        const int result = m_printer_agent->set_user_selected_machine(dev_id);
+        BOOST_LOG_TRIVIAL(info) << "NetworkAgent::set_user_selected_machine: result=" << result;
+        return result;
+    }
+    BOOST_LOG_TRIVIAL(warning) << "NetworkAgent::set_user_selected_machine: no printer agent";
     return -1;
 }
 
@@ -946,15 +952,27 @@ int NetworkAgent::stop_subscribe(std::string module)
 
 int NetworkAgent::add_subscribe(std::vector<std::string> dev_list)
 {
-    if (m_printer_agent)
-        return m_printer_agent->add_subscribe(std::move(dev_list));
+    BOOST_LOG_TRIVIAL(info) << "NetworkAgent::add_subscribe: count=" << dev_list.size()
+                            << " printer_agent=" << (m_printer_agent ? m_printer_agent->get_agent_info().id : "<null>");
+    if (m_printer_agent) {
+        const int result = m_printer_agent->add_subscribe(std::move(dev_list));
+        BOOST_LOG_TRIVIAL(info) << "NetworkAgent::add_subscribe: result=" << result;
+        return result;
+    }
+    BOOST_LOG_TRIVIAL(warning) << "NetworkAgent::add_subscribe: no printer agent";
     return -1;
 }
 
 int NetworkAgent::del_subscribe(std::vector<std::string> dev_list)
 {
-    if (m_printer_agent)
-        return m_printer_agent->del_subscribe(std::move(dev_list));
+    BOOST_LOG_TRIVIAL(info) << "NetworkAgent::del_subscribe: count=" << dev_list.size()
+                            << " printer_agent=" << (m_printer_agent ? m_printer_agent->get_agent_info().id : "<null>");
+    if (m_printer_agent) {
+        const int result = m_printer_agent->del_subscribe(std::move(dev_list));
+        BOOST_LOG_TRIVIAL(info) << "NetworkAgent::del_subscribe: result=" << result;
+        return result;
+    }
+    BOOST_LOG_TRIVIAL(warning) << "NetworkAgent::del_subscribe: no printer agent";
     return -1;
 }
 
@@ -1020,6 +1038,14 @@ std::string NetworkAgent::get_local_camera_stream_url() const
     if (m_printer_agent)
         return m_printer_agent->get_camera_url();
     return {};
+}
+
+std::unique_ptr<ICameraSignalingChannel>
+NetworkAgent::create_camera_signaling_channel(const std::string& dev_id)
+{
+    if (m_printer_agent)
+        return m_printer_agent->create_camera_signaling_channel(dev_id);
+    return nullptr;
 }
 
 int NetworkAgent::request_bind_ticket(std::string* ticket)

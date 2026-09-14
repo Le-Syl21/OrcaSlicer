@@ -3,6 +3,7 @@
 #include "IPrinterAgent.hpp"
 #include "libslic3r/Preset.hpp"
 #include "libslic3r/PresetBundle.hpp"
+#include "libslic3r/Utils.hpp"
 #include "slic3r/GUI/GUI_App.hpp"
 #include "slic3r/GUI/DeviceCore/DevFilaSystem.h"
 #include "slic3r/GUI/DeviceCore/DevManager.h"
@@ -2077,6 +2078,14 @@ void MoonrakerPrinterAgent::start_status_stream(const std::string& dev_id, const
 void MoonrakerPrinterAgent::stop_status_stream()
 {
     ws_stop.store(true);
+    {
+        // Wake a blocked synchronous ws.read()/ws.write() in run_status_stream();
+        // ws_stop by itself is only observed between reads.
+        std::lock_guard<std::mutex> lock(ws_abort_mutex);
+        if (ws_abort_io) {
+            ws_abort_io();
+        }
+    }
     if (ws_thread.joinable()) {
         ws_thread.join();
     }
@@ -2113,6 +2122,25 @@ void MoonrakerPrinterAgent::run_status_stream(std::string dev_id, std::string ba
             stream.connect(results);
 
             websocket::stream<beast::tcp_stream> ws{std::move(stream)};
+
+            // Allow stop_status_stream() to force this socket shut so a blocked
+            // synchronous ws.read()/ws.write() returns with an error (Beast's
+            // expires_after() does not bound synchronous operations). Declared
+            // after `ws` so the hook is cleared before `ws` is destroyed on every
+            // exit path (fallthrough, break, exception); ws_abort_mutex keeps the
+            // hook from running against a half-destroyed `ws`.
+            ScopeGuard ws_abort_guard([this] {
+                std::lock_guard<std::mutex> lock(ws_abort_mutex);
+                ws_abort_io = nullptr;
+            });
+            {
+                std::lock_guard<std::mutex> lock(ws_abort_mutex);
+                ws_abort_io = [&ws] {
+                    beast::error_code ec;
+                    ws.next_layer().socket().shutdown(tcp::socket::shutdown_both, ec);
+                };
+            }
+
             ws.set_option(websocket::stream_base::decorator([&](websocket::request_type& req) {
                 req.set(http::field::user_agent, "OrcaSlicer");
                 if (!api_key.empty()) {

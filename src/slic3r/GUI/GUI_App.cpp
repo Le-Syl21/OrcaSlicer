@@ -3,6 +3,7 @@
 #include "libslic3r/Technologies.hpp"
 #include "libslic3r/Platform.hpp"
 #include "GUI_App.hpp"
+#include "DeviceCore/DevConfigUtil.h"
 #include "GUI_Init.hpp"
 #include "GUI_ObjectList.hpp"
 #include "slic3r/GUI/UserManager.hpp"
@@ -2393,6 +2394,11 @@ bool GUI_App::is_blocking_printing(MachineObject *obj_)
     PresetBundle *preset_bundle = wxGetApp().preset_bundle;
     std::string    source_model  = preset_bundle->printers.get_edited_preset().get_printer_type(preset_bundle);
 
+    if (DevPrinterConfigUtil::is_optional_printer_model_id(source_model) ||
+        DevPrinterConfigUtil::is_optional_printer_model_id(target_model)) {
+        return false;
+    }
+
     if (source_model != target_model) {
         std::vector<std::string>      compatible_machine = obj_->get_compatible_machine();
         vector<std::string>::iterator it                 = find(compatible_machine.begin(), compatible_machine.end(), source_model);
@@ -3996,6 +4002,7 @@ void GUI_App::switch_printer_agent()
 
     std::string log_dir        = data_dir();
     std::string cloud_agent_id = agent_info.id == BBL_PRINTER_AGENT_ID ? BBL_CLOUD_PROVIDER : ORCA_CLOUD_PROVIDER;
+    BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << " " << agent_info.id;
     std::shared_ptr<ICloudServiceAgent> cloud_agent = m_agent->get_cloud_agent(cloud_agent_id);
 
     // Create new printer agent via registry
@@ -4971,11 +4978,12 @@ bool GUI_App::is_user_login(const std::string& provider/* = ORCA_CLOUD_PROVIDER*
     return false;
 }
 
-const std::string& GUI_App::get_printer_cloud_provider() const
+std::string GUI_App::get_printer_cloud_provider() const
 {
-    // Orca todo: this need to be revisted. currently it is mainly used for device manager and related clausses and only bambu machines use them.
-    // 
-    return BBL_CLOUD_PROVIDER;
+    std::string provider = preset_bundle->printers.get_edited_preset().config.opt_string("printer_agent");
+    if (provider.empty())
+        provider = ORCA_CLOUD_PROVIDER;
+    return provider;
 }
 
 

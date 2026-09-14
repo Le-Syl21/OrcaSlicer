@@ -240,6 +240,13 @@ private:
     std::atomic<uint64_t> ws_last_emit_ms{0};
     std::thread         ws_thread;
 
+    // stop_status_stream() invokes ws_abort_io to wake a blocked synchronous
+    // ws.read()/ws.write()/handshake in run_status_stream(): ws_stop is only
+    // observed between reads, and Beast's expires_after() does not bound
+    // synchronous operations.
+    std::mutex             ws_abort_mutex;
+    std::function<void()>  ws_abort_io;  // guarded by ws_abort_mutex
+
     // AMS/filament refresh cadence, independent of telemetry dispatch so a steady
     // stream of status updates can't starve it (ws_last_emit_ms is reset by those).
     static constexpr uint64_t AMS_REFRESH_INTERVAL_MS = 10000;
