@@ -150,8 +150,8 @@ wxSize WebRtcMediaController::GetVideoSize() const
 void WebRtcMediaController::bind_data_channel(const std::shared_ptr<rtc::DataChannel>& dc)
 {
     const std::string label = dc->label();
-    dc->onOpen([this, label] { BOOST_LOG_TRIVIAL(info) << "WebRTC: data channel '" << label << "' open"; });
-    dc->onClosed([this, label] { BOOST_LOG_TRIVIAL(info) << "WebRTC: data channel '" << label << "' closed"; });
+    dc->onOpen([label] { BOOST_LOG_TRIVIAL(info) << "WebRTC: data channel '" << label << "' open"; });
+    dc->onClosed([label] { BOOST_LOG_TRIVIAL(info) << "WebRTC: data channel '" << label << "' closed"; });
     dc->onError([label](std::string e) {
         BOOST_LOG_TRIVIAL(warning) << "WebRTC: data channel '" << label << "' error: " << e;
     });
