@@ -38,7 +38,7 @@ endif()
 # the deps-built FFmpeg libraries and adds an $ORIGIN rpath, since the ELF
 # loader does not search the executable's directory and the CI unit-test runner
 # only receives the tests artifact (no deps install).
-function(orcaslicer_copy_test_dlls)
+function(orcaslicer_copy_test_dlls TARGET)
     if (WIN32)
         set(_configs ${CMAKE_CONFIGURATION_TYPES})
         if (NOT _configs)
@@ -57,18 +57,18 @@ function(orcaslicer_copy_test_dlls)
         # into it). Copy them next to the executable and give it an $ORIGIN
         # rpath so the loader finds them when the tests run on the CI unit-test
         # runner, which only receives this build/tests tree.
-        get_target_property(_linked_libs ${_TEST_NAME}_tests LINK_LIBRARIES)
+        get_target_property(_linked_libs ${TARGET} LINK_LIBRARIES)
         if (NOT "libslic3r_gui" IN_LIST _linked_libs)
             return()
         endif()
 
-        set_property(TARGET ${_TEST_NAME}_tests PROPERTY BUILD_RPATH "$ORIGIN")
+        set_property(TARGET ${TARGET} PROPERTY BUILD_RPATH "$ORIGIN")
         set(_configs ${CMAKE_CONFIGURATION_TYPES})
         if (NOT _configs)
             set(_configs "${CMAKE_BUILD_TYPE}")
         endif()
         foreach(_cfg IN LISTS _configs)
-            orcaslicer_copy_sos(${_TEST_NAME}_tests "${_cfg}" "" _unused_sos)
+            orcaslicer_copy_sos(${TARGET} "${_cfg}" "" _unused_sos)
         endforeach()
     endif()
 endfunction()
