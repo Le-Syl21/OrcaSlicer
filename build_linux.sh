@@ -547,7 +547,7 @@ if [[ -n "${LINKER_NAME}" ]] ; then
 
     if command -v "${LINKER_BIN_NAME}" >/dev/null 2>&1 ; then
         LINKER_BIN=$(command -v "${LINKER_BIN_NAME}")
-        export CMAKE_LINKER_ARGS=(-DCMAKE_LINKER="${LINKER_BIN}" -DCMAKE_EXE_LINKER_FLAGS=-fuse-ld=${LINKER_NAME} -DCMAKE_SHARED_LINKER_FLAGS=-fuse-ld=${LINKER_NAME} -DCMAKE_MODULE_LINKER_FLAGS=-fuse-ld=${LINKER_NAME})
+        export CMAKE_LINKER_ARGS=(-DCMAKE_LINKER="${LINKER_BIN}" "-DCMAKE_EXE_LINKER_FLAGS=-fuse-ld=${LINKER_NAME}" "-DCMAKE_SHARED_LINKER_FLAGS=-fuse-ld=${LINKER_NAME}" "-DCMAKE_MODULE_LINKER_FLAGS=-fuse-ld=${LINKER_NAME}")
     else
         case "${LINKER_NAME}" in
             lld )
