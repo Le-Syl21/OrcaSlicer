@@ -402,10 +402,12 @@ void MediaPlayCtrl::Play()
         return;
     }
     default: // assumed to be CameraStreamMode::none
-        NetworkAgent* agent = wxGetApp().getAgent();
-        if (agent && agent->get_printer_agent()->get_agent_info().id != BBL_PRINTER_AGENT_ID) {
-            Stop(_L("Camera not available"));
-            return;
+        if (NetworkAgent* agent = wxGetApp().getAgent()) {
+            if (auto printer_agent = agent->get_printer_agent()) {
+                if (printer_agent->get_agent_info().id != BBL_PRINTER_AGENT_ID) {
+                    return;
+                }
+            }
         }
         break;
     }
