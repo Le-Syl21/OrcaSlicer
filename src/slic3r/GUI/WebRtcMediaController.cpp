@@ -184,9 +184,8 @@ void WebRtcMediaController::on_ready(std::vector<CameraIceServer> servers)
     configuration.iceServers.emplace_back("stun:stun.cloudflare.com:3478");
     configuration.iceServers.emplace_back("stun:stun.l.google.com:19302");
 
+    BOOST_LOG_TRIVIAL(info) << "WebRTC: creating peer connection with " << configuration.iceServers.size() << " ice servers";
     auto peer_connection = std::make_shared<rtc::PeerConnection>(std::move(configuration));
-    BOOST_LOG_TRIVIAL(info) << "WebRTC: creating peer connection with " << configuration.iceServers.size()
-                            << " ice servers";
     peer_connection->onLocalDescription([this](rtc::Description description) {
         if (!m_alive.load())
             return;
