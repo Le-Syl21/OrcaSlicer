@@ -2,6 +2,7 @@
 # GUI WebRTC camera controller. Keep the source revision fixed: the signaling
 # protocol is evolving independently of this transport dependency.
 orcaslicer_add_cmake_project(DataChannel
+    DEPENDS ${OPENSSL_PKG}
     CMAKE_ARGS
         -DNO_EXAMPLES=ON
         -DNO_TESTS=ON
@@ -18,5 +19,3 @@ orcaslicer_add_cmake_project(DataChannel
     GIT_SHALLOW ON
     GIT_SUBMODULES_RECURSE ON
 )
-
-set(DEP_DataChannel_DEPENDS OpenSSL)
