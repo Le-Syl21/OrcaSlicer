@@ -18,3 +18,5 @@ orcaslicer_add_cmake_project(DataChannel
     GIT_SHALLOW ON
     GIT_SUBMODULES_RECURSE ON
 )
+
+set(DEP_DataChannel_DEPENDS OpenSSL)
