@@ -24,7 +24,6 @@
 #include <boost/locale/encoding_utf.hpp>
 #include <boost/log/detail/native_typeof.hpp>
 #include <libslic3r/Config.hpp>
-#include <mutex>
 #include <slic3r/plugin/PythonPluginInterface.hpp>
 #include <wx/event.h>
 
@@ -41,9 +40,11 @@
 #include <iterator>
 #include <exception>
 #include <cstdlib>
+#include <mutex>
 #include <regex>
 #include <thread>
 #include <string_view>
+
 #include <boost/algorithm/string/predicate.hpp>
 #include <boost/algorithm/string.hpp>
 #include <boost/format.hpp>
@@ -88,7 +89,6 @@
 #include "libslic3r/Thread.hpp"
 #include "libslic3r/miniz_extension.hpp"
 #include "libslic3r/Utils.hpp"
-#include "libslic3r/Color.hpp"
 #include "slic3r/plugin/PluginManager.hpp"
 #include "slic3r/plugin/host/PluginHostUi.hpp"
 #include "slic3r/plugin/PythonInterpreter.hpp"
@@ -108,14 +108,12 @@
 #include "../Utils/PrintHost.hpp"
 #include "../Utils/Process.hpp"
 #include "../Utils/wxInspectorPlugins/Registration.hpp"
-#include "../Utils/MacDarkMode.hpp"
 #include "../Utils/Http.hpp"
 #include "../Utils/InstanceID.hpp"
 #include "../Utils/UndoRedo.hpp"
 #include "slic3r/Config/Snapshot.hpp"
 #include "Preferences.hpp"
 #include "Tab.hpp"
-#include "SysInfoDialog.hpp"
 #include "UpdateDialogs.hpp"
 #include "Mouse3DController.hpp"
 #include "RemovableDriveManager.hpp"
@@ -129,8 +127,6 @@
 #include "PrintHostDialogs.hpp"
 #include "NetworkPluginDialog.hpp"
 #include "DesktopIntegrationDialog.hpp"
-#include "SendSystemInfoDialog.hpp"
-#include "ParamsDialog.hpp"
 #include "KBShortcutsDialog.hpp"
 #include "DownloadProgressDialog.hpp"
 #include "TroubleshootDialog.hpp"
@@ -141,7 +137,6 @@
 #include "Widgets/ProgressDialog.hpp"
 
 //BBS: DailyTip and UserGuide Dialog
-#include "WebDownPluginDlg.hpp"
 #include "WebGuideDialog.hpp"
 #include "ReleaseNote.hpp"
 #include "PrivacyUpdateDialog.hpp"
@@ -3976,7 +3971,7 @@ void GUI_App::set_live_printer_agent(std::shared_ptr<IPrinterAgent> agent)
     sidebar().update_all_preset_comboboxes();
 }
 
-std::string GUI_App::resolve_printer_agent_id(const std::string& stored_id)
+std::string GUI_App::resolve_printer_agent_id(const std::string& stored_id) const
 {
     if (!stored_id.empty())
         return stored_id;
@@ -4990,11 +4985,12 @@ bool GUI_App::is_user_login(const std::string& provider/* = ORCA_CLOUD_PROVIDER*
 
 std::string GUI_App::get_printer_cloud_provider() const
 {
-    std::string provider = preset_bundle->printers.get_edited_preset().config.opt_string("printer_agent");
-    if (provider.empty())
-        provider = ORCA_CLOUD_PROVIDER;
-    return provider;
+    const std::string agent_id = resolve_printer_agent_id(
+        preset_bundle ? preset_bundle->printers.get_edited_preset().config.opt_string("printer_agent")
+                      : std::string());
+    return agent_id == BBL_PRINTER_AGENT_ID ? BBL_CLOUD_PROVIDER : ORCA_CLOUD_PROVIDER;
 }
+
 
 
 bool GUI_App::check_login(const std::string& provider/* = ORCA_CLOUD_PROVIDER*/)
