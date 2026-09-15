@@ -8,7 +8,7 @@ SCRIPT_PATH=$(dirname "$(readlink -f "${0}")")
 pushd "${SCRIPT_PATH}" > /dev/null
 
 function usage() {
-    echo "Usage: ./${SCRIPT_NAME} [-1][-b][-c][-d][-D][-e][-F][-g][-h][-i][-j N][-p][-r][-s][-t][-u][-l][-L][-M]"
+    echo "Usage: ./${SCRIPT_NAME} [-1][-b][-c][-d][-D][-e][-F][-g][-h][-i][-j N][-p][-r][-s][-t][-u][-l][-L [lld|mold]]"
     echo "   -1: limit builds to one core (where possible)"
     echo "   -j N: limit builds to N cores (where possible)"
     echo "   -b: build in Debug mode"
@@ -27,8 +27,7 @@ function usage() {
     echo "   -t: build tests (optional), requires -s flag"
     echo "   -u: install system dependencies (asks for sudo password; build prerequisite)"
     echo "   -l: use Clang instead of GCC (default: GCC)"
-    echo "   -L: use ld.lld as linker (if available)"
-    echo "   -M: use mold as linker (if available)"
+    echo "   -L [lld|mold]: use an alternate linker (if available) (default: lld)"
     echo "For a first use, you want to './${SCRIPT_NAME} -u'"
     echo "   and then './${SCRIPT_NAME} -dsi'"
     echo "For a GitHub Actions-like Linux build locally, use './${SCRIPT_NAME} -g -istrlL'"
@@ -42,7 +41,7 @@ unset name
 BUILD_DIR=build
 BUILD_CONFIG=Release
 FORWARDED_ARGS=()
-while getopts ":1j:bcCdDeFghiprstulLM" opt ; do
+while getopts ":1j:bcCdDeFghiprstulL" opt ; do
   case ${opt} in
     1 )
         export CMAKE_BUILD_PARALLEL_LEVEL=1
@@ -116,12 +115,24 @@ while getopts ":1j:bcCdDeFghiprstulLM" opt ; do
         FORWARDED_ARGS+=("-l")
         ;;
     L )
-        USE_LLD="1"
-        FORWARDED_ARGS+=("-L")
-        ;;
-    M )
-        USE_MOLD="1"
-        FORWARDED_ARGS+=("-M")
+        # -L takes an optional argument. getopts has no native support for
+        # this, so L is declared bare (no ':') in the optstring above, and we
+        # manually peek at the next unconsumed argv token via ${!OPTIND}. If
+        # it's a bare 'lld' or 'mold' (not another option, i.e. doesn't start
+        # with '-'), consume it as the explicit choice and advance OPTIND so
+        # getopts doesn't reprocess it as a new flag. Otherwise, leave it
+        # alone (it isn't meant for -L) and default to lld.
+        LINKER_NAME="lld"
+        next_arg="${!OPTIND-}"
+        if [[ -n "${next_arg}" ]] && [[ "${next_arg}" != -* ]] ; then
+            case "${next_arg}" in
+                lld|mold )
+                    LINKER_NAME="${next_arg}"
+                    OPTIND=$((OPTIND + 1))
+                    ;;
+            esac
+        fi
+        FORWARDED_ARGS+=("-L" "${LINKER_NAME}")
         ;;
     * )
 	echo "Unknown argument '${opt}', aborting."
@@ -140,8 +151,9 @@ if [[ -n "${CLEAN_DOCKER_IMAGE}" ]] && [[ -z "${USE_DOCKER}" ]] ; then
     exit 1
 fi
 
-if [[ -n "${USE_LLD}" ]] && [[ -n "${USE_MOLD}" ]] ; then
-    echo "Error: -L and -M are mutually exclusive."
+if [[ -n "${USE_DOCKER}" ]] && [[ "${LINKER_NAME}" == "mold" ]] ; then
+    echo "Error: -L mold is not available in the Docker/Podman build image, so -g and -L mold cannot be combined."
+    echo "Omit -L mold when using -g (the container build defaults to GCC without mold), or drop -g and build with -L mold directly on a host with mold installed."
     exit 1
 fi
 
@@ -502,26 +514,49 @@ if [[ -n "${USE_CLANG}" ]] ; then
     export CMAKE_C_CXX_COMPILER_CLANG=(-DCMAKE_C_COMPILER=/usr/bin/clang -DCMAKE_CXX_COMPILER=/usr/bin/clang++)
 fi
 
-# Configure use of ld.lld as the linker when requested
-export CMAKE_LLD_LINKER_ARGS=()
-if [[ -n "${USE_LLD}" ]] ; then
-    if command -v ld.lld >/dev/null 2>&1 ; then
-        LLD_BIN=$(command -v ld.lld)
-        export CMAKE_LLD_LINKER_ARGS=(-DCMAKE_LINKER="${LLD_BIN}" -DCMAKE_EXE_LINKER_FLAGS=-fuse-ld=lld -DCMAKE_SHARED_LINKER_FLAGS=-fuse-ld=lld -DCMAKE_MODULE_LINKER_FLAGS=-fuse-ld=lld)
-    else
-        echo "Error: ld.lld not found. Please install the 'lld' package (e.g., sudo apt install lld) or omit -L."
-        exit 1
-    fi
-fi
+# Configure use of an alternate linker (-L lld or -L mold) when requested
+export CMAKE_LINKER_ARGS=()
+if [[ -n "${LINKER_NAME}" ]] ; then
+    case "${LINKER_NAME}" in
+        lld )
+            LINKER_BIN_NAME="ld.lld"
+            ;;
+        mold )
+            LINKER_BIN_NAME="mold"
+            # -fuse-ld=mold requires GCC 12.1+. Older GCC (e.g. GCC 11, shipped
+            # for Ubuntu 22.x via scripts/linux.d/debian) doesn't understand the
+            # flag, and cmake's compiler check then fails with a confusing
+            # generic "is not able to compile a simple test program" error
+            # instead of naming the real cause. Catch it here instead.
+            if [[ -z "${USE_CLANG}" ]] ; then
+                GCC_BIN="${CC:-gcc}"
+                if ! command -v "${GCC_BIN}" >/dev/null 2>&1 ; then
+                    GCC_BIN="cc"
+                fi
+                if command -v "${GCC_BIN}" >/dev/null 2>&1 ; then
+                    GCC_VERSION=$("${GCC_BIN}" -dumpfullversion 2>/dev/null)
+                    if [[ -n "${GCC_VERSION}" ]] && [[ "$(printf '%s\n%s\n' "${GCC_VERSION}" "12.1" | sort -V | head -n1)" != "12.1" ]] ; then
+                        echo "Error: -L mold requires GCC 12.1 or newer to support -fuse-ld=mold (found GCC ${GCC_VERSION} via '${GCC_BIN}')."
+                        echo "Use -l to build with Clang instead, upgrade your GCC toolchain, or omit -L mold."
+                        exit 1
+                    fi
+                fi
+            fi
+            ;;
+    esac
 
-# Configure use of mold as the linker when requested
-export CMAKE_MOLD_LINKER_ARGS=()
-if [[ -n "${USE_MOLD}" ]] ; then
-    if command -v mold >/dev/null 2>&1 ; then
-        MOLD_BIN=$(command -v mold)
-        export CMAKE_MOLD_LINKER_ARGS=(-DCMAKE_LINKER="${MOLD_BIN}" -DCMAKE_EXE_LINKER_FLAGS=-fuse-ld=mold -DCMAKE_SHARED_LINKER_FLAGS=-fuse-ld=mold -DCMAKE_MODULE_LINKER_FLAGS=-fuse-ld=mold)
+    if command -v "${LINKER_BIN_NAME}" >/dev/null 2>&1 ; then
+        LINKER_BIN=$(command -v "${LINKER_BIN_NAME}")
+        export CMAKE_LINKER_ARGS=(-DCMAKE_LINKER="${LINKER_BIN}" -DCMAKE_EXE_LINKER_FLAGS=-fuse-ld=${LINKER_NAME} -DCMAKE_SHARED_LINKER_FLAGS=-fuse-ld=${LINKER_NAME} -DCMAKE_MODULE_LINKER_FLAGS=-fuse-ld=${LINKER_NAME})
     else
-        echo "Error: mold not found. Please install the 'mold' package or omit -M."
+        case "${LINKER_NAME}" in
+            lld )
+                echo "Error: ld.lld not found. Please install the 'lld' package (e.g., sudo apt install lld) or omit -L lld."
+                ;;
+            mold )
+                echo "Error: mold not found. Please install the 'mold' package or omit -L mold."
+                ;;
+        esac
         exit 1
     fi
 fi
@@ -558,7 +593,7 @@ if [[ -n "${BUILD_DEPS}" ]] ; then
         BUILD_ARGS+=(-DCMAKE_BUILD_TYPE="${BUILD_CONFIG}")
     fi
 
-    print_and_run cmake -S deps -B deps/$BUILD_DIR "${CMAKE_C_CXX_COMPILER_CLANG[@]}" "${CMAKE_LLD_LINKER_ARGS[@]}" "${CMAKE_MOLD_LINKER_ARGS[@]}" "${CMAKE_CCACHE_ARGS[@]}" -G Ninja "${COLORED_OUTPUT}" "${BUILD_ARGS[@]}"
+    print_and_run cmake -S deps -B deps/$BUILD_DIR "${CMAKE_C_CXX_COMPILER_CLANG[@]}" "${CMAKE_LINKER_ARGS[@]}" "${CMAKE_CCACHE_ARGS[@]}" -G Ninja "${COLORED_OUTPUT}" "${BUILD_ARGS[@]}"
     print_and_run cmake --build deps/$BUILD_DIR -j1
 fi
 
@@ -578,7 +613,7 @@ if [[ -n "${BUILD_ORCA}" ]] || [[ -n "${BUILD_TESTS}" ]] ; then
         BUILD_ARGS+=(-DORCA_UPDATER_SIG_KEY="${ORCA_UPDATER_SIG_KEY}")
     fi
 
-    print_and_run cmake -S . -B $BUILD_DIR "${CMAKE_C_CXX_COMPILER_CLANG[@]}" "${CMAKE_LLD_LINKER_ARGS[@]}" "${CMAKE_MOLD_LINKER_ARGS[@]}" "${CMAKE_CCACHE_ARGS[@]}" -G "Ninja Multi-Config" \
+    print_and_run cmake -S . -B $BUILD_DIR "${CMAKE_C_CXX_COMPILER_CLANG[@]}" "${CMAKE_LINKER_ARGS[@]}" "${CMAKE_CCACHE_ARGS[@]}" -G "Ninja Multi-Config" \
 -DSLIC3R_PCH=${SLIC3R_PRECOMPILED_HEADERS} \
 -DORCA_TOOLS=ON \
 "${COLORED_OUTPUT}" \
