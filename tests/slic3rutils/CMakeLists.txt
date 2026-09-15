@@ -31,7 +31,7 @@ endif ()
 target_link_libraries(${_TEST_NAME}_tests test_common libslic3r_gui libslic3r pybind11::embed Catch2::Catch2WithMain)
 set_property(TARGET ${_TEST_NAME}_tests PROPERTY FOLDER "tests")
 
-orcaslicer_copy_test_dlls(${_TEST_NAME}_tests)
+orcaslicer_copy_test_dlls()
 
 orcaslicer_stage_test_python_runtime(${_TEST_NAME}_tests)
 
@@ -52,7 +52,7 @@ set_property(TARGET printer_agent_plugin_tests PROPERTY FOLDER "tests")
 # beside the shared test output dir; serialize them so the copies can't race.
 add_dependencies(printer_agent_plugin_tests ${_TEST_NAME}_tests)
 
-orcaslicer_copy_test_dlls(printer_agent_plugin_tests)
+orcaslicer_copy_test_dlls()
 
 orcaslicer_stage_test_python_runtime(printer_agent_plugin_tests)
 
