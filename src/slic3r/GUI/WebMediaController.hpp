@@ -11,7 +11,7 @@ namespace Slic3r { namespace GUI {
 class WebMediaController : public IMediaController
 {
 public:
-    explicit WebMediaController(wxWebView *webview);
+    explicit WebMediaController(wxWebView* webview);
 
     void Load(wxURI url) override;
 
@@ -21,14 +21,8 @@ public:
 
     void Stop() override;
 
-    // wxMediaState GetState() override;
-
-    // int GetLastError() const override;
-
-    // wxSize GetVideoSize() const override;
-
 private:
-    wxWebView * m_webview;
+    wxWebView* m_webview;
     std::string m_url;
     CameraStreamMode m_stream_mode = CameraStreamMode::http;
 };

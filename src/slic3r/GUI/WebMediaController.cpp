@@ -68,19 +68,4 @@ void WebMediaController::Stop()
         m_webview->Stop();
 }
 
-// wxMediaState WebMediaController::GetState()
-// {
-//     return wxMediaState{};
-// }
-
-// int WebMediaController::GetLastError() const
-// {
-//     return 0;
-// }
-
-// wxSize WebMediaController::GetVideoSize() const
-// {
-//     return wxSize{};
-// }
-
 }} // namespace Slic3r::GUI
