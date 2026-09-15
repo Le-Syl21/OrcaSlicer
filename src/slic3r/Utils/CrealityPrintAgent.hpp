@@ -1,7 +1,6 @@
 #ifndef __CREALITY_PRINT_AGENT_HPP__
 #define __CREALITY_PRINT_AGENT_HPP__
 
-#include "IPrinterAgent.hpp"
 #include "MoonrakerPrinterAgent.hpp"
 
 #include <string>
