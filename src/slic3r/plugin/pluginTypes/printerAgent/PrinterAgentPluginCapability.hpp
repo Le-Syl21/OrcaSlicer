@@ -24,8 +24,8 @@ public:
     PluginCapabilityType get_type() const override { return PluginCapabilityType::PrinterConnection; }
 
     // set_cloud_agent is the host-managed dependency injection point — the host hands the
-    // capability its ICloudServiceAgent — so it is the one operation kept native here. Every
-    // other IPrinterAgent operation is pure: the Python plugin must implement all of them.
+    // capability its ICloudServiceAgent — so it is the one operation kept native here. Optional
+    // operations inherit IPrinterAgent's defaults; the remaining operations are plugin-defined.
     void set_cloud_agent(std::shared_ptr<ICloudServiceAgent> cloud) final override { (void) cloud; }
 
     AgentInfo get_agent_info() override = 0;
@@ -57,31 +57,6 @@ public:
     int set_on_local_message_fn(OnMessageFn fn) override               = 0;
     int set_queue_on_main_fn(QueueOnMainFn fn) override                = 0;
 
-    // The following functions are not required to be implemented for the printer agent to work.
-    // Each default mirrors IPrinterAgent's own "not supported" fallback, so a plugin that skips
-    // one of these behaves like an agent that never had the capability.
-    FilamentSyncMode get_filament_sync_mode() const override { return FilamentSyncMode::none; }
-    bool fetch_filament_info(std::string dev_id, FilamentSyncMode sync_mode) override { return false; }
-    CameraStreamMode get_camera_stream_mode() const override { return CameraStreamMode::none; }
-    std::string get_camera_url() const override { return {}; }
-    void install_device_cert(std::string dev_id, bool lan_only) override {}
-    int check_cert() override { return ORCA_NETWORK_ERR_CAP_NOT_AVAILABLE; }
-    int ping_bind(std::string ping_code) override { return ORCA_NETWORK_ERR_CAP_NOT_AVAILABLE; }
-    int bind(std::string dev_ip,
-             std::string dev_id,
-             std::string dev_model,
-             std::string sec_link,
-             std::string timezone,
-             bool improved,
-             OnUpdateStatusFn update_fn) override
-    { return ORCA_NETWORK_ERR_CAP_NOT_AVAILABLE; }
-    int unbind(std::string dev_id) override { return ORCA_NETWORK_ERR_CAP_NOT_AVAILABLE; }
-    // request_bind_ticket has a std::string* out-param that cannot round-trip through a
-    // pybind11 override directly; the trampoline dispatches it manually (the Python plugin
-    // returns a (result, ticket) tuple) and falls back to this default when there's no override.
-    int request_bind_ticket(std::string* ticket) override { return ORCA_NETWORK_ERR_CAP_NOT_AVAILABLE; }
-    int get_hms_snapshot(std::string dev_id, std::string file_name, std::function<void(std::string, int)> callback) override
-    { return ORCA_NETWORK_ERR_CAP_NOT_AVAILABLE; }
 };
 
 } // namespace Slic3r

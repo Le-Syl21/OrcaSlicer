@@ -150,12 +150,16 @@ public:
     /**
      * Validate current user certificates for the printer.
      */
-    virtual int check_cert() = 0;
+    virtual int check_cert() { return BAMBU_NETWORK_SUCCESS; }
 
     /**
      * Install or refresh device certificate for LAN TLS.
      */
-    virtual void install_device_cert(std::string dev_id, bool lan_only) = 0;
+    virtual void install_device_cert(std::string dev_id, bool lan_only)
+    {
+        (void) dev_id;
+        (void) lan_only;
+    }
 
     // ========================================================================
     // Discovery
@@ -171,7 +175,11 @@ public:
     /**
      * Ping the binding endpoint to check printer readiness.
      */
-    virtual int ping_bind(std::string ping_code) = 0;
+    virtual int ping_bind(std::string ping_code)
+    {
+        (void) ping_code;
+        return BAMBU_NETWORK_SUCCESS;
+    }
 
     /**
      * Perform binding detection/handshake on a LAN printer.
@@ -181,23 +189,50 @@ public:
     /**
      * Execute the multi-stage printer binding workflow.
      */
-    virtual int bind(std::string dev_ip, std::string dev_id, std::string dev_model, std::string sec_link, std::string timezone, bool improved, OnUpdateStatusFn update_fn) = 0;
+    virtual int bind(std::string dev_ip, std::string dev_id, std::string dev_model, std::string sec_link,
+                     std::string timezone, bool improved, OnUpdateStatusFn update_fn)
+    {
+        (void) dev_ip;
+        (void) dev_id;
+        (void) dev_model;
+        (void) sec_link;
+        (void) timezone;
+        (void) improved;
+        (void) update_fn;
+        return BAMBU_NETWORK_SUCCESS;
+    }
 
     /**
      * Remove the association between account and printer.
      */
-    virtual int unbind(std::string dev_id) = 0;
+    virtual int unbind(std::string dev_id)
+    {
+        (void) dev_id;
+        return BAMBU_NETWORK_SUCCESS;
+    }
 
     /**
      * Request a one-time bind ticket from the server.
      */
-    virtual int request_bind_ticket(std::string* ticket) = 0;
+    virtual int request_bind_ticket(std::string* ticket)
+    {
+        if (ticket)
+            *ticket = {};
+        return BAMBU_NETWORK_SUCCESS;
+    }
 
     /**
      * Fetch the cloud snapshot image captured at a print failure.
      * Returns 0 if the request was dispatched; the image body arrives via callback(body, http_status).
      */
-    virtual int get_hms_snapshot(std::string dev_id, std::string file_name, std::function<void(std::string, int)> callback) = 0;
+    virtual int get_hms_snapshot(std::string dev_id, std::string file_name,
+                                 std::function<void(std::string, int)> callback)
+    {
+        (void) dev_id;
+        (void) file_name;
+        (void) callback;
+        return -1;
+    }
 
     /**
      * Register callback for fatal HTTP errors.
