@@ -3985,7 +3985,6 @@ void StatusPanel::update_sdcard_subtask(MachineObject *obj)
 
     const wxString thumbnail_url = wxString(obj->m_agent_thumbnail_url);
     if (!thumbnail_url.IsEmpty()) {
-        // why: Moonraker has no prediction or weight data, so keep it on the sdcard path.
         if (m_request_url != thumbnail_url || !m_load_sdcard_thumbnail) {
             if (web_request.IsOk() && web_request.GetState() == wxWebRequest::State_Active)
                 web_request.Cancel();
