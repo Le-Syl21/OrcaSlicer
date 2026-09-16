@@ -13,8 +13,8 @@ void init_rtc_logger_once()
 {
     static std::once_flag flag;
     std::call_once(flag, [] {
-        rtc::InitLogger(rtc::LogLevel::Verbose, [](rtc::LogLevel level, std::string message) {
-            BOOST_LOG_TRIVIAL(info) << "[rtc:" << static_cast<int>(level) << "] " << message;
+        rtc::InitLogger(rtc::LogLevel::Warning, [](rtc::LogLevel level, std::string message) {
+            BOOST_LOG_TRIVIAL(trace) << "[rtc:" << static_cast<int>(level) << "] " << message;
         });
     });
 }
