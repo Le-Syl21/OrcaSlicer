@@ -8,6 +8,8 @@
 #include "IPrinterAgent.hpp"
 
 #include <map>
+#include <atomic>
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <vector>
@@ -54,6 +56,7 @@ public:
     // Sub-agent accessors
     std::shared_ptr<ICloudServiceAgent> get_cloud_agent(const std::string& provider = ORCA_CLOUD_PROVIDER) const;
     std::shared_ptr<IPrinterAgent> get_printer_agent() const { return m_printer_agent; }
+    std::uint64_t get_user_machine_list_generation() const { return m_user_machine_list_generation.load(); }
 
     // Shared agent management
     void add_cloud_agent(const std::string& provider, std::shared_ptr<ICloudServiceAgent> agent);
@@ -214,6 +217,7 @@ private:
     std::map<std::string, std::shared_ptr<ICloudServiceAgent>> m_cloud_agents;
     std::shared_ptr<IPrinterAgent> m_printer_agent;
     std::string m_printer_agent_id;
+    std::atomic<std::uint64_t> m_user_machine_list_generation{0};
 };
 
 }

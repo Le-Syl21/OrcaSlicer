@@ -4,6 +4,7 @@
 #include <algorithm>
 
 #include <boost/log/trivial.hpp>
+#include <nlohmann/json.hpp>
 #include "IPrinterAgent.hpp"
 #include "libslic3r/Utils.hpp"
 #include "NetworkAgent.hpp"
@@ -116,6 +117,8 @@ void NetworkAgent::add_cloud_agent(const std::string& provider, std::shared_ptr<
 
 void NetworkAgent::set_printer_agent(std::shared_ptr<IPrinterAgent> printer_agent)
 {
+    m_user_machine_list_generation.fetch_add(1);
+
     // Disconnect all callbacks from the old agent
     auto old_printer_agent = m_printer_agent;
 
@@ -433,10 +436,26 @@ int NetworkAgent::check_user_task_report(int* task_id, bool* printable, const st
 
 int NetworkAgent::get_user_print_info(unsigned int* http_code, std::string* http_body, const std::string& provider)
 {
+    const std::string request_agent_id = m_printer_agent_id;
+    const std::uint64_t request_generation = m_user_machine_list_generation.fetch_add(1) + 1;
     const auto cloud_agent = get_cloud_agent(provider);
-    if (cloud_agent)
-        return cloud_agent->get_user_print_info(http_code, http_body);
-    return -1;
+    if (!cloud_agent)
+        return -1;
+
+    const int result = cloud_agent->get_user_print_info(http_code, http_body);
+    if (result == 0 && http_body) {
+        try {
+            nlohmann::json response = nlohmann::json::parse(*http_body);
+            response["provider"] = provider;
+            response["agent_id"] = request_agent_id;
+            response["generation"] = request_generation;
+            *http_body = response.dump();
+        }
+        catch (const std::exception& e) {
+            BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << " metadata injection exception=" << e.what();
+        }
+    }
+    return result;
 }
 
 int NetworkAgent::get_user_tasks(TaskQueryParams params, std::string* http_body, const std::string& provider)

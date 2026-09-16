@@ -847,7 +847,23 @@ namespace Slic3r
         try
         {
             json j = json::parse(body);
-            const std::string provider = GUI::wxGetApp().get_printer_cloud_provider();
+
+            const bool has_request_context = j.contains("provider") && j.contains("agent_id") && j.contains("generation");
+            const std::string provider = j.contains("provider") ? j["provider"].get<std::string>()
+                                                                   : GUI::wxGetApp().get_printer_cloud_provider();
+            const std::string agent_id = j.contains("agent_id") ? j["agent_id"].get<std::string>()
+                                                                  : get_current_printer_agent_id();
+            const std::uint64_t generation = j.value("generation", std::uint64_t(0));
+
+            if (has_request_context &&
+                (provider != GUI::wxGetApp().get_printer_cloud_provider() ||
+                 agent_id != get_current_printer_agent_id() ||
+                 generation != (m_agent ? m_agent->get_user_machine_list_generation() : 0))) {
+                BOOST_LOG_TRIVIAL(debug) << __FUNCTION__ << ": ignoring stale response provider="
+                                         << provider << " agent_id=" << agent_id
+                                         << " generation=" << generation;
+                return;
+            }
 
 #if !BBL_RELEASE_TO_PUBLIC
             BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ": " << j;
@@ -872,12 +888,12 @@ namespace Slic3r
                         obj->set_dev_id(dev_id);
                         // A device can be rediscovered by a different agent after a preset
                         // switch while retaining the same MachineObject instance.
-                        obj->printer_agent_id = get_current_printer_agent_id();
+                        obj->printer_agent_id = agent_id;
                     }
                     else
                     {
                         obj = new MachineObject(this, m_agent, "", "", "");
-                        obj->printer_agent_id = get_current_printer_agent_id();
+                        obj->printer_agent_id = agent_id;
                         if (m_agent)
                         {
                             obj->set_bind_status(m_agent->get_user_name(provider));
