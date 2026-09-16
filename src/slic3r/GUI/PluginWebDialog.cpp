@@ -8,6 +8,7 @@
 #include <boost/filesystem.hpp>
 
 #include <wx/event.h>
+#include <wx/uri.h>
 
 #include <utility>
 
@@ -53,6 +54,14 @@ wxString web_base_url()
 {
     const std::string dir = (boost::filesystem::path(resources_dir()) / "web").make_preferred().string();
     return wxString("file://") + from_u8(dir) + "/";
+}
+
+// Whether a loaded document is the plugin HTML's own base URL. The web view reports the URL it
+// parsed, so any fragment the page navigated to is ignored and the escaping it applies to what the
+// resources path holds (a space, a non-ASCII character) is undone first.
+bool is_content_url(const wxString& url)
+{
+    return wxURI::Unescape(url.BeforeFirst('#')) == web_base_url();
 }
 
 } // namespace
@@ -139,19 +148,31 @@ void PluginWebDialog::destroy_for_plugin(PluginWebDialog* dialog)
 
 void PluginWebDialog::on_bootstrap_event(wxWebViewEvent& event)
 {
-    // The first bootstrap load (or its error) triggers the swap to plugin HTML;
-    // the resulting plugin-page load is ignored (guarded by m_content_loaded).
-    load_plugin_content();
+    // The first bootstrap load (or its error) triggers the swap to plugin HTML.
+    if (!m_content_loaded)
+        load_plugin_content();
+    // WebKit reloads the SetPage base URL rather than the injected page, and the injected document
+    // reports that same URL, so a load of it that is not the swap we started is a browser reload
+    // and the plugin HTML has to be put back. A page the plugin linked to arrives under its own
+    // URL and is left alone; a post-load error only ever means a failed subresource. The Edge
+    // backend ignores the base URL, so the comparison never matches there, and WebView2 reloads
+    // SetPage content from its own history entry anyway.
+    else if (event.GetEventType() == wxEVT_WEBVIEW_LOADED) {
+        if (m_own_page_load)
+            m_own_page_load = false;
+        else if (is_content_url(event.GetURL()))
+            load_plugin_content();
+    }
     event.Skip();
 }
 
 void PluginWebDialog::load_plugin_content()
 {
-    if (m_content_loaded)
-        return;
     m_content_loaded = true;
-    if (wxWebView* wv = browser())
+    if (wxWebView* wv = browser()) {
+        m_own_page_load = true;
         wv->SetPage(wxString::FromUTF8(m_html), web_base_url());
+    }
 }
 
 void PluginWebDialog::on_script_message(const nlohmann::json& payload)

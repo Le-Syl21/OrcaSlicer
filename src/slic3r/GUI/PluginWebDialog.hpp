@@ -72,6 +72,7 @@ private:
 
     std::string                   m_html;
     bool                          m_content_loaded{false};
+    bool                          m_own_page_load{false}; // a SetPage of the plugin HTML is in flight
     bool                          m_open{true};
     bool                          m_close_fired{false};
     std::optional<nlohmann::json> m_result;
