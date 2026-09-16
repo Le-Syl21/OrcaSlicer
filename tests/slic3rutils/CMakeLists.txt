@@ -33,6 +33,43 @@ set_property(TARGET ${_TEST_NAME}_tests PROPERTY FOLDER "tests")
 
 orcaslicer_copy_test_dlls(${_TEST_NAME}_tests)
 
-orcaslicer_stage_test_python_runtime(${_TEST_NAME}_tests)
+if (WIN32)
+    add_custom_command(TARGET ${_TEST_NAME}_tests POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:${_TEST_NAME}_tests>/python"
+        COMMAND ${CMAKE_COMMAND} -E copy_directory "${CMAKE_PREFIX_PATH}/libpython" "$<TARGET_FILE_DIR:${_TEST_NAME}_tests>/python"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_PREFIX_PATH}/libpython/python${_bundled_python_abi}.dll"
+            "${CMAKE_PREFIX_PATH}/libpython/vcruntime140.dll"
+            "${CMAKE_PREFIX_PATH}/libpython/vcruntime140_1.dll"
+            "$<TARGET_FILE_DIR:${_TEST_NAME}_tests>"
+        COMMENT "Copying Python runtime for slic3rutils plugin host API tests"
+        VERBATIM
+    )
+elseif (APPLE)
+    target_link_options(${_TEST_NAME}_tests PRIVATE
+        "LINKER:-rpath,@executable_path/python/lib")
+
+    add_custom_command(TARGET ${_TEST_NAME}_tests POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E rm -rf
+            "$<TARGET_FILE_DIR:${_TEST_NAME}_tests>/python"
+        COMMAND ${CMAKE_COMMAND} -E copy_directory
+            "${CMAKE_PREFIX_PATH}/libpython"
+            "$<TARGET_FILE_DIR:${_TEST_NAME}_tests>/python"
+        COMMENT "Copying Python runtime for macOS plugin host API tests"
+        VERBATIM
+    )
+elseif (FLATPAK)
+    # Same <testdir>/python home as WIN32/APPLE; symlink since /app/libpython
+    # already ships in the flatpak (the test exe links libpython3.12.so from it).
+    add_custom_command(TARGET ${_TEST_NAME}_tests POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E rm -rf
+            "$<TARGET_FILE_DIR:${_TEST_NAME}_tests>/python"
+        COMMAND ${CMAKE_COMMAND} -E create_symlink
+            "${CMAKE_PREFIX_PATH}/libpython"
+            "$<TARGET_FILE_DIR:${_TEST_NAME}_tests>/python"
+        COMMENT "Linking Python runtime for flatpak plugin host API tests"
+        VERBATIM
+    )
+endif()
 
 orcaslicer_discover_tests(${_TEST_NAME}_tests)
