@@ -2534,20 +2534,7 @@ bool SelectMachineDialog::is_blocking_printing(MachineObject* obj_)
         }
     }
 
-    if (DevPrinterConfigUtil::is_optional_printer_model_id(source_model) ||
-        DevPrinterConfigUtil::is_optional_printer_model_id(target_model)) {
-        return false;
-    }
-
-    if (source_model != target_model) {
-        std::vector<std::string> compatible_machine = obj_->get_compatible_machine();
-        vector<std::string>::iterator it = find(compatible_machine.begin(), compatible_machine.end(), source_model);
-        if (it == compatible_machine.end()) {
-            return true;
-        }
-    }
-
-    return false;
+    return !DevPrinterConfigUtil::is_printer_model_compatible(source_model, *obj_);
 }
 
 static std::unordered_set<int> _get_used_nozzle_idxes()

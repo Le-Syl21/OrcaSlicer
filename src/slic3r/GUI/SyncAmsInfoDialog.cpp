@@ -1863,7 +1863,6 @@ bool SyncAmsInfoDialog::is_blocking_printing(MachineObject *obj_)
 {
     DeviceManager *dev = Slic3r::GUI::wxGetApp().getDeviceManager();
     if (!dev) return true;
-    auto        target_model = obj_->printer_type;
     std::string source_model = "";
 
     if (m_print_type == PrintFromType::FROM_NORMAL) {
@@ -1874,18 +1873,7 @@ bool SyncAmsInfoDialog::is_blocking_printing(MachineObject *obj_)
         if (m_required_data_plate_data_list.size() > 0) { source_model = m_required_data_plate_data_list[m_print_plate_idx]->printer_model_id; }
     }
 
-    if (DevPrinterConfigUtil::is_optional_printer_model_id(source_model) ||
-        DevPrinterConfigUtil::is_optional_printer_model_id(target_model)) {
-        return false;
-    }
-
-    if (source_model != target_model) {
-        std::vector<std::string>      compatible_machine = obj_->get_compatible_machine();
-        vector<std::string>::iterator it                 = find(compatible_machine.begin(), compatible_machine.end(), source_model);
-        if (it == compatible_machine.end()) { return true; }
-    }
-
-    return false;
+    return !DevPrinterConfigUtil::is_printer_model_compatible(source_model, *obj_);
 }
 
 bool SyncAmsInfoDialog::is_same_nozzle_type(std::string &filament_type, NozzleType &tag_nozzle_type)

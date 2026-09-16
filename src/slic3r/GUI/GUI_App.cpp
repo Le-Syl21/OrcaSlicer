@@ -2382,14 +2382,8 @@ bool GUI_App::is_blocking_printing(MachineObject *obj_)
 {
     DeviceManager *dev = Slic3r::GUI::wxGetApp().getDeviceManager();
     if (!dev) return true;
-    std::string target_model;
     if (obj_ == nullptr) {
         obj_ = dev->get_selected_machine();
-        if (obj_) {
-            target_model = obj_->printer_type;
-        }
-    } else {
-        target_model = obj_->printer_type;
     }
 
     if (!obj_)
@@ -2400,19 +2394,7 @@ bool GUI_App::is_blocking_printing(MachineObject *obj_)
     PresetBundle *preset_bundle = wxGetApp().preset_bundle;
     std::string    source_model  = preset_bundle->printers.get_edited_preset().get_printer_type(preset_bundle);
 
-    if (DevPrinterConfigUtil::is_optional_printer_model_id(source_model) ||
-        DevPrinterConfigUtil::is_optional_printer_model_id(target_model)) {
-        return false;
-    }
-
-    if (source_model != target_model) {
-        std::vector<std::string>      compatible_machine = obj_->get_compatible_machine();
-        vector<std::string>::iterator it                 = find(compatible_machine.begin(), compatible_machine.end(), source_model);
-        if (it == compatible_machine.end()) {
-            return true;
-        }
-    }
-    return false;
+    return !DevPrinterConfigUtil::is_printer_model_compatible(source_model, *obj_);
 }
 
 // If formatted for github, plaintext with OpenGL extensions enclosed into <details>.

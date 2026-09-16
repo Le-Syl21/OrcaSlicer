@@ -1349,22 +1349,7 @@ bool SendToPrinterDialog::is_blocking_printing(MachineObject* obj_)
 
     PresetBundle* preset_bundle = wxGetApp().preset_bundle;
     auto source_model = preset_bundle->printers.get_edited_preset().get_printer_type(preset_bundle);
-    auto target_model = obj_->printer_type;
-
-    if (DevPrinterConfigUtil::is_optional_printer_model_id(source_model) ||
-        DevPrinterConfigUtil::is_optional_printer_model_id(target_model)) {
-        return false;
-    }
-
-    if (source_model != target_model) {
-        std::vector<std::string> compatible_machine = obj_->get_compatible_machine();
-        vector<std::string>::iterator it = find(compatible_machine.begin(), compatible_machine.end(), source_model);
-        if (it == compatible_machine.end()) {
-            return true;
-        }
-    }
-
-    return false;
+    return !DevPrinterConfigUtil::is_printer_model_compatible(source_model, *obj_);
 }
 
 void SendToPrinterDialog::Enable_Refresh_Button(bool en)
