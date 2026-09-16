@@ -910,7 +910,7 @@ void MediaPlayCtrl::load()
     m_last_state = MEDIASTATE_LOADING;
     SetStatus(_L("Loading..."));
     const auto mode = current_mode();
-    if (mode != CameraStreamMode::rtsp && mode != CameraStreamMode::http) {
+    if (mode == CameraStreamMode::none && wxGetApp().app_config->get("internal_developer_mode") == "true") {
         std::string file_h264 = data_dir() + "/video.h264";
         std::string file_info = data_dir() + "/video.info";
         BOOST_LOG_TRIVIAL(info) << "MediaPlayCtrl dump video to " << file_h264;
