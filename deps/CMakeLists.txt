@@ -388,12 +388,8 @@ endif()
 include(FFMPEG/FFMPEG.cmake)
 include(Assimp/Assimp.cmake)
 
-find_package(LibDataChannel QUIET)
-set(DATACHANNEL_PKG "")
-if (NOT LibDataChannel_FOUND)
-    include(DataChannel/DataChannel.cmake)
-    set(DATACHANNEL_PKG dep_DataChannel)
-endif()
+include(DataChannel/DataChannel.cmake)
+set(DATACHANNEL_PKG dep_DataChannel)
 
 # we don't want to load a "wrong" openssl when loading curl
 # so, just don't even bother
