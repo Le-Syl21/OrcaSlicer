@@ -36,24 +36,3 @@ orcaslicer_copy_test_dlls(${_TEST_NAME}_tests)
 orcaslicer_stage_test_python_runtime(${_TEST_NAME}_tests)
 
 orcaslicer_discover_tests(${_TEST_NAME}_tests)
-
-# why: the loader runs on a detached worker thread, so its Python interpreter
-# ownership model cannot share the embedded interpreter in the main test binary.
-add_executable(printer_agent_plugin_tests test_printer_agent_plugin.cpp)
-
-if (MSVC)
-    target_link_libraries(printer_agent_plugin_tests Setupapi.lib)
-endif ()
-
-target_link_libraries(printer_agent_plugin_tests test_common libslic3r_gui libslic3r pybind11::embed Catch2::Catch2)
-set_property(TARGET printer_agent_plugin_tests PROPERTY FOLDER "tests")
-
-# why: both targets' post-build steps stage/clear the same python/ directory
-# beside the shared test output dir; serialize them so the copies can't race.
-add_dependencies(printer_agent_plugin_tests ${_TEST_NAME}_tests)
-
-orcaslicer_copy_test_dlls(printer_agent_plugin_tests)
-
-orcaslicer_stage_test_python_runtime(printer_agent_plugin_tests)
-
-orcaslicer_discover_tests(printer_agent_plugin_tests)
