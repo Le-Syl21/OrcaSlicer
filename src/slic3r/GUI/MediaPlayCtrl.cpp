@@ -554,8 +554,7 @@ void MediaPlayCtrl::StopWebStream()
 
 void MediaPlayCtrl::Stop(wxString const &msg, wxString const &msg2)
 {
-    const bool webrtc_active = m_webrtc_ctrl && (m_last_mode == CameraStreamMode::webrtc ||
-                                                  current_mode() == CameraStreamMode::webrtc);
+    const bool webrtc_active = m_webrtc_ctrl && m_last_mode == CameraStreamMode::webrtc;
     BOOST_LOG_TRIVIAL(info) << "MediaPlayCtrl::Stop: last_state=" << m_last_state
                             << " webrtc_active=" << webrtc_active << " failed_code=" << m_failed_code
                             << " msg='" << msg.ToUTF8().data() << "'";
@@ -565,11 +564,11 @@ void MediaPlayCtrl::Stop(wxString const &msg, wxString const &msg2)
         m_media_ctrl->EndExternalStream();
         m_webrtc_stopping = false;
     }
-    switch (current_mode()) {
+    switch (m_last_mode) {
     case CameraStreamMode::http:
     case CameraStreamMode::https:
     case CameraStreamMode::http_snapshot: {
-        const bool snapshot = current_mode() == CameraStreamMode::http_snapshot;
+        const bool snapshot = m_last_mode == CameraStreamMode::http_snapshot;
         if (m_last_state != MEDIASTATE_IDLE) {
             if (snapshot) {
                 if (m_web_ctrl) m_web_ctrl->Stop();
