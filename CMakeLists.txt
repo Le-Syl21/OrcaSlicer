@@ -837,18 +837,6 @@ if (SLIC3R_GUI)
         endif()
     endif()
 
-    if (NOT TARGET libSRTP::srtp2)
-        find_library(_ORCA_SRTP_LIBRARY NAMES srtp2
-            PATHS "${CMAKE_PREFIX_PATH}/lib" NO_DEFAULT_PATH)
-        if (_ORCA_SRTP_LIBRARY)
-            add_library(libSRTP::srtp2 UNKNOWN IMPORTED GLOBAL)
-            set_target_properties(libSRTP::srtp2 PROPERTIES
-                IMPORTED_LOCATION "${_ORCA_SRTP_LIBRARY}"
-                IMPORTED_LINK_INTERFACE_LANGUAGES C
-                INTERFACE_LINK_LIBRARIES "OpenSSL::Crypto")
-        endif()
-    endif()
-
     if (NOT TARGET LibJuice::LibJuice)
         find_library(_ORCA_LIBJUICE_LIBRARY NAMES juice
             PATHS "${CMAKE_PREFIX_PATH}/lib" NO_DEFAULT_PATH)

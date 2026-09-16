@@ -1,4 +1,4 @@
-# libdatachannel is the native ICE/DTLS/SCTP/SRTP implementation used by the
+# libdatachannel is the native ICE/DTLS/SCTP implementation used by the
 # GUI WebRTC camera controller. Keep the source revision fixed: the signaling
 # protocol is evolving independently of this transport dependency.
 orcaslicer_add_cmake_project(DataChannel
@@ -7,9 +7,8 @@ orcaslicer_add_cmake_project(DataChannel
         -DNO_EXAMPLES=ON
         -DNO_TESTS=ON
         -DNO_WEBSOCKET=ON
-        -DNO_MEDIA=OFF
+        -DNO_MEDIA=ON
         -DUSE_NICE=OFF
-        -DUSE_SYSTEM_SRTP=OFF
         -DUSE_SYSTEM_JUICE=OFF
         -DUSE_SYSTEM_USRSCTP=OFF
         -DOPENSSL_ROOT_DIR:PATH=${DESTDIR}
