@@ -92,6 +92,10 @@ TEST_CASE("integration: orca.printer_agent binding surface", "[integration][Pyth
     CHECK(py::hasattr(mode, "Subscription"));
     CHECK(py::hasattr(mode, "None_"));
 
+    REQUIRE(py::hasattr(pa, "CameraStreamMode"));
+    py::object camera_mode = pa.attr("CameraStreamMode");
+    CHECK(py::hasattr(camera_mode, "HTTPS"));
+
     // Plugin-type enum exposed at module root (host reads it without the GIL).
     CHECK(py::hasattr(orca, "PluginType"));
 }

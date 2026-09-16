@@ -50,6 +50,7 @@ enum class FilamentSyncMode {
 enum class CameraStreamMode {
     none = 0,
     http,  // LAN or Cloud
+    https, // LAN or Cloud over TLS
     rtsp,  // LAN only
     webrtc, // Cloud only
     http_snapshot // HTTP endpoint returning one image per request
@@ -330,7 +331,7 @@ public:
 
     /**
      * Get the camera stream mode for this agent. This value can be deterministic and derived at
-     * runtime if the printer supports multiple camera stream modes. E.g. LAN => HTTP/RTSP, Cloud => WebRTC.
+     * runtime if the printer supports multiple camera stream modes. E.g. LAN => HTTP/HTTPS/RTSP, Cloud => WebRTC.
      *
      * @return CameraStreamMode indicating how the camera stream is obtained or used:
      */
@@ -355,7 +356,7 @@ public:
 
     /**
      * Get the current camera stream URL for this agent's active machine.
-     * Only meaningful when get_camera_stream_mode() returns an HTTP or RTSP mode.
+     * Only meaningful when get_camera_stream_mode() returns an HTTP, HTTPS, or RTSP mode.
      */
     virtual std::string get_camera_url() const { return {}; }
 

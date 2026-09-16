@@ -184,6 +184,7 @@ void MediaPlayCtrl::SetMachineObject(MachineObject* obj)
 
     switch (mode) {
     case CameraStreamMode::http:
+    case CameraStreamMode::https:
     case CameraStreamMode::http_snapshot:
     case CameraStreamMode::rtsp: {
         std::string machine = obj ? obj->get_dev_id() : "";
@@ -346,6 +347,7 @@ void MediaPlayCtrl::Play()
         SetStatus(_L("Playing..."), false);
         return;
     case CameraStreamMode::http:
+    case CameraStreamMode::https:
     case CameraStreamMode::rtsp:
         if (m_next_retry.IsValid() && wxDateTime::Now() < m_next_retry)
             return;
@@ -565,13 +567,14 @@ void MediaPlayCtrl::Stop(wxString const &msg, wxString const &msg2)
     }
     switch (current_mode()) {
     case CameraStreamMode::http:
+    case CameraStreamMode::https:
     case CameraStreamMode::http_snapshot: {
         const bool snapshot = current_mode() == CameraStreamMode::http_snapshot;
         if (m_last_state != MEDIASTATE_IDLE) {
             if (snapshot) {
                 if (m_web_ctrl) m_web_ctrl->Stop();
             } else {
-                // http mode plays through the ffmpeg backend (m_media_ctrl), not
+                // http/https mode plays through the ffmpeg backend (m_media_ctrl), not
                 // the webview - tear its read thread down too, otherwise it keeps
                 // pulling and painting frames after the UI says "Video Stopped".
                 boost::unique_lock lock(m_mutex);
