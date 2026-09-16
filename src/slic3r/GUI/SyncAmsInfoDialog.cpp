@@ -2130,7 +2130,7 @@ void SyncAmsInfoDialog::update_user_printer()
     std::map<std::string, MachineObject *> option_list;
 
     // user machine list
-    option_list = dev->get_my_machine_list();
+    option_list = dev->get_my_machine_list(dev->get_current_printer_agent_id());
 
     // same machine only appear once
     for (auto it = option_list.begin(); it != option_list.end(); it++) {

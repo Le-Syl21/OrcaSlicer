@@ -510,7 +510,7 @@ namespace Slic3r
 
     MachineObject* DeviceManager::get_my_machine(std::string dev_id)
     {
-        auto list = get_my_machine_list();
+        auto list = get_my_machine_list(get_current_printer_agent_id());
         auto it = list.find(dev_id);
         if (it != list.end())
         {
@@ -571,7 +571,7 @@ namespace Slic3r
     {
         BOOST_LOG_TRIVIAL(info) << "set_selected_machine=" << dev_id
             << " cur_selected=" << selected_machine;
-        auto my_machine_list = get_my_machine_list();
+        auto my_machine_list = get_my_machine_list(get_current_printer_agent_id());
         auto it = my_machine_list.find(dev_id);
         BOOST_LOG_TRIVIAL(info) << "Orca diagnostic: set_selected_machine lookup dev_id=" << dev_id
                                 << " found=" << (it != my_machine_list.end())
@@ -585,6 +585,7 @@ namespace Slic3r
                                     << " dev_connection_type=" << it->second->dev_connection_type;
         } else {
             BOOST_LOG_TRIVIAL(warning) << "Orca diagnostic: target machine was not found in the current agent's machine list";
+            return false;
         }
 
         // disconnect last if dev_id difference from previous one
