@@ -3,6 +3,7 @@
 #include <exception>
 
 #include "DevManager.h"
+#include "CloudProvider.hpp"
 #include "DevUtil.h"
 
 // TODO: remove this include
@@ -911,7 +912,7 @@ namespace Slic3r
                     // Orca cloud printers are only ever delivered through this REST
                     // account list; tag them so DeviceManager's cloud/lan branches
                     // (subscribe + deselect in set_selected_machine) treat them right.
-                    if (provider == "orca")
+                    if (provider == ORCA_CLOUD_PROVIDER)
                         obj->dev_connection_type = "cloud";
 
                     if (!elem["dev_id"].is_null())
