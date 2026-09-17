@@ -146,6 +146,12 @@ if [ ${OPTIND} -eq 1 ] ; then
     exit 1
 fi
 
+shift $((OPTIND - 1))
+if [ $# -ne 0 ] ; then
+    echo "Unknown argument '$1', aborting."
+    exit 1
+fi
+
 if [[ -n "${CLEAN_DOCKER_IMAGE}" ]] && [[ -z "${USE_DOCKER}" ]] ; then
     echo "Error: -F requires -g."
     exit 1
