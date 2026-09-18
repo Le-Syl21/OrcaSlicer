@@ -326,9 +326,15 @@ modules:
         dest: external-packages/FFMPEG
 
       # libdatachannel v0.24.5
-      - type: file
-        url: https://github.com/paullouisageneau/libdatachannel/archive/refs/tags/v0.24.5.tar.gz
-        sha256: 454537c3cd526bed935d847bb2dff4046f266eef84d43b2a5f2f2f293c0026f4
+      # Use git instead of archive: it vendors plog, usrsctp and libjuice as
+      # git submodules, which a plain GitHub tag tarball does not include.
+      # Cloned (with submodules) straight into the ExternalProject source dir
+      # that deps/DataChannel/DataChannel.cmake expects, since the sandboxed
+      # build step has no network to do this itself.
+      - type: git
+        url: https://github.com/paullouisageneau/libdatachannel.git
+        tag: v0.24.5
+        commit: 443f6934d9007eb7076ab7825ba330f355fcbead
         dest: deps/build_flatpak/dep_DataChannel-prefix/src/dep_DataChannel
 
       # ---------------------------------------------------------------

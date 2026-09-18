@@ -238,7 +238,7 @@ if (NOT IS_CROSS_COMPILE OR NOT APPLE)
                 DEPENDEES download # do after download
                 COMMENT "Freeing Space: Removing source archive"
                 WORKING_DIRECTORY ${DEP_DOWNLOAD_DIR}
-                COMMAND ${CMAKE_COMMAND} -E rm -r ${projectname}
+                COMMAND ${CMAKE_COMMAND} -E rm -rf ${projectname}
         )
         ExternalProject_Add_Step(dep_${projectname} free_build_space
                 DEPENDEES install # do after install
