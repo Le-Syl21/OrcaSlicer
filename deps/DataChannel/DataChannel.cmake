@@ -14,7 +14,7 @@ orcaslicer_add_cmake_project(DataChannel
         -DOPENSSL_ROOT_DIR:PATH=${DESTDIR}
         -DOPENSSL_USE_STATIC_LIBS=ON
     GIT_REPOSITORY https://github.com/paullouisageneau/libdatachannel.git
-    GIT_TAG v0.22.2
+    GIT_TAG v0.24.5
     GIT_SHALLOW ON
     GIT_SUBMODULES_RECURSE ON
 )
