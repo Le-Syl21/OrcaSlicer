@@ -891,7 +891,7 @@ void UnsavedChangesDialog::build(Preset::Type type, PresetCollection *dependent_
     top_title_temp_v->Add(top_title_temp_h, 1, wxALIGN_CENTER, 0);
     m_panel_temp->SetSizer(top_title_temp_v);
     m_panel_temp->Layout();
-    m_sizer_top->Add(m_panel_temp, 1, wxALIGN_CENTER, 0);
+    m_sizer_top->Add(m_panel_temp, 0, wxALIGN_CENTER, 0);
 
     title_block_middle = new wxPanel(m_table_top, wxID_ANY, wxDefaultPosition, wxDefaultSize, wxTAB_TRAVERSAL);
     title_block_middle->SetBackgroundColour(wxColour(172, 172, 172));
@@ -935,11 +935,12 @@ void UnsavedChangesDialog::build(Preset::Type type, PresetCollection *dependent_
     m_panel_newv->Layout();
     m_sizer_top->Add(m_panel_newv, 0, wxALIGN_CENTER, 0);
     //m_sizer_top->Add(top_title_newv, 1, wxALIGN_CENTER, 0);
+    m_sizer_top->AddStretchSpacer();
 
     m_table_top->SetSizer(m_sizer_top);
     m_table_top->Layout();
     m_sizer_top->Fit(m_table_top);
-    m_sizer_tab->Add(m_table_top, 1, 0, 0);
+    m_sizer_tab->Add(m_table_top, 0, wxEXPAND, 0);
 
     m_scrolledWindow = new wxScrolledWindow(m_panel_tab, wxID_ANY, wxDefaultPosition, UNSAVE_CHANGE_DIALOG_SCROLL_WINDOW_SIZE,  wxNO_BORDER|wxVSCROLL);
     m_scrolledWindow->SetScrollRate(0, 5);
