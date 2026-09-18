@@ -1,4 +1,6 @@
 #include <catch2/catch_test_macros.hpp>
+#include <nlohmann/json.hpp>
+#include <slic3r/Utils/AmsPayload.hpp>
 #include <slic3r/Utils/OrcaCloudServiceAgent.hpp>
 #include <slic3r/Utils/OrcaPrinterAgent.hpp>
 
@@ -46,7 +48,7 @@ TEST_CASE("OrcaPrinterAgent stamps the get_capabilities nozzle diameter onto pus
     // is cached for the device.
     agent.deliver_to_sink(
         "dev-1",
-        R"({"info":{"command":"get_capabilities","capabilities":{"topology":{"tools":[{"id":"T0","nozzle":{"diameter_mm":0.4}}]}}}})",
+        R"({"info":{"command":"get_capabilities","capabilities":{"topology":{"tools":[{"id":"T0","nozzle":{"diameter_mm":0.4}}]},"protocol":{"ams_ops":["change_filament"]}}}})",
         /*local=*/false);
     CHECK(last_payload.find("\"command\":\"get_capabilities\"") != std::string::npos);
     CHECK(last_payload.find("\"print\"") == std::string::npos);
@@ -65,6 +67,14 @@ TEST_CASE("OrcaPrinterAgent stamps the get_capabilities nozzle diameter onto pus
     agent.deliver_to_sink("dev-1", R"({"print":{"command":"push_status","nozzle_diameter":0.6}})", /*local=*/false);
     CHECK(last_payload.find("\"nozzle_diameter\":0.6") != std::string::npos);
     CHECK(last_payload.find("N/A") == std::string::npos);
+
+    // The reply's declared ams_ops register on the device (OPCP §7.8): the one
+    // declared op passes the client gate, an undeclared one is rejected.
+    bool unsupported = false;
+    OrcaPrinterAgent::canonicalize_ams_payload("dev-1", R"({"print":{"command":"ams_change_filament","target":1}})", &unsupported);
+    CHECK_FALSE(unsupported);
+    OrcaPrinterAgent::canonicalize_ams_payload("dev-1", R"({"print":{"command":"ams_control","param":"pause"}})", &unsupported);
+    CHECK(unsupported);
 }
 
 TEST_CASE("OrcaPrinterAgent::parse_lan_endpoint", "[OrcaPrinterAgent]") {
@@ -89,6 +99,89 @@ TEST_CASE("connect_printer wires up a LAN Config", "[OrcaPrinterAgent][.integrat
     CHECK(rc == BAMBU_NETWORK_SUCCESS);
     CHECK(agent.lan_connection_target() == "ws://10.255.255.1:8280/mqtt");
     CHECK(agent.get_user_selected_machine().empty());   // LAN path must not touch the cloud selection
+    agent.disconnect_printer();
+}
+
+// why hidden: connect_printer starts a detached connect worker, like the LAN
+// test above. The sync mode follows the printer's own AMS capability, not the
+// transport: a connected printer stays `none` until its get_capabilities reply
+// declares a material system. The registry is process-wide, so this test uses
+// ids no other test feeds capabilities for.
+TEST_CASE("filament sync follows the printer's AMS capability", "[OrcaPrinterAgent][.integration]") {
+    Probe agent("/tmp");
+    CHECK(agent.get_filament_sync_mode() == Slic3r::FilamentSyncMode::none);
+
+    REQUIRE(agent.connect_printer("dev-ams-1", "10.255.255.1", "orcasonar", "code", false) == BAMBU_NETWORK_SUCCESS);
+    // Connected, but no capability reply yet: still none.
+    CHECK(agent.get_filament_sync_mode() == Slic3r::FilamentSyncMode::none);
+
+    // features.fms=true is the authoritative material-system flag.
+    agent.deliver_to_sink("dev-ams-1",
+        R"({"info":{"command":"get_capabilities","capabilities":{"protocol":{"features":{"fms":true},"ams_ops":["change_filament"]}}}})",
+        /*local=*/true);
+    CHECK(agent.get_filament_sync_mode() == Slic3r::FilamentSyncMode::subscription);
+
+    // An explicit false clears it again.
+    agent.deliver_to_sink("dev-ams-1",
+        R"({"info":{"command":"get_capabilities","capabilities":{"protocol":{"features":{"fms":false}}}}})",
+        /*local=*/true);
+    CHECK(agent.get_filament_sync_mode() == Slic3r::FilamentSyncMode::none);
+
+    // Older payloads without features.fms fall back to a non-empty ams_ops.
+    agent.deliver_to_sink("dev-ams-1",
+        R"({"info":{"command":"get_capabilities","capabilities":{"protocol":{"ams_ops":["change_filament"]}}}})",
+        /*local=*/true);
+    CHECK(agent.get_filament_sync_mode() == Slic3r::FilamentSyncMode::subscription);
+
+    // The pull contract (Sidebar's blocking path) is gone: a pull-mode fetch is
+    // refused by the mode guard, and a subscription fetch for a device that is
+    // not the active printer is refused before any HTTP.
+    CHECK_FALSE(agent.fetch_filament_info("dev-ams-1", Slic3r::FilamentSyncMode::pull));
+    CHECK_FALSE(agent.fetch_filament_info("dev-ams-2", Slic3r::FilamentSyncMode::subscription));
+
+    agent.disconnect_printer();
+    CHECK(agent.get_filament_sync_mode() == Slic3r::FilamentSyncMode::none);
+}
+
+// The subscription refresh is self-triggered: a pushed frame whose print block
+// carries a CHANGED topology_state.material_hash (spec REQ-STS-007 §7.7) is
+// the doorbell; repeat hashes, temperature-only frames and hash-less blocks
+// are not (no per-frame polling regression).
+TEST_CASE("a material_hash change is the filament-sync doorbell", "[OrcaPrinterAgent][.integration]") {
+    Probe agent("/tmp");
+    REQUIRE(agent.connect_printer("dev-1", "10.255.255.1", "orcasonar", "code", false) == BAMBU_NETWORK_SUCCESS);
+
+    const std::string frame_a = R"({"print":{"command":"push_status","topology_state":{"material_hash":"sha256:aaaaaaaaaaaaaaaa","units":[]}}})";
+    CHECK(agent.filament_doorbell_needed_for_test("dev-1", frame_a));
+    CHECK_FALSE(agent.filament_doorbell_needed_for_test("dev-1", frame_a));
+    CHECK(agent.filament_doorbell_needed_for_test("dev-1",
+        R"({"print":{"command":"push_status","topology_state":{"material_hash":"sha256:bbbbbbbbbbbbbbbb","units":[]}}})"));
+    // Topology block without the doorbell token (older/foreign payload): stays quiet.
+    CHECK_FALSE(agent.filament_doorbell_needed_for_test("dev-1",
+        R"({"print":{"command":"push_status","topology_state":{"units":[]}}})"));
+    CHECK_FALSE(agent.filament_doorbell_needed_for_test("dev-1", R"({"print":{"command":"push_status","mc_percent":10}})"));
+    // Not the active LAN device: never a doorbell.
+    CHECK_FALSE(agent.filament_doorbell_needed_for_test("dev-2", frame_a));
+
+    agent.disconnect_printer();
+    CHECK_FALSE(agent.filament_doorbell_needed_for_test("dev-1", frame_a));
+}
+
+// After a failed lane_data fetch there is no retry timer: any next LAN frame
+// re-arms the refresh, because a changing printer keeps pushing.
+TEST_CASE("a failed filament fetch retries on the next LAN frame", "[OrcaPrinterAgent][.integration]") {
+    Probe agent("/tmp");
+    REQUIRE(agent.connect_printer("dev-1", "10.255.255.1", "orcasonar", "code", false) == BAMBU_NETWORK_SUCCESS);
+
+    const std::string telemetry = R"({"print":{"command":"push_status","mc_percent":10}})";
+    CHECK_FALSE(agent.filament_doorbell_needed_for_test("dev-1", telemetry));
+    agent.set_filament_failed_for_test(true);
+    CHECK(agent.filament_doorbell_needed_for_test("dev-1", telemetry));
+
+    agent.disconnect_printer();
+    // disconnect clears the latch; the next connect eager-fetches instead.
+    REQUIRE(agent.connect_printer("dev-1", "10.255.255.1", "orcasonar", "code", false) == BAMBU_NETWORK_SUCCESS);
+    CHECK_FALSE(agent.filament_doorbell_needed_for_test("dev-1", telemetry));
     agent.disconnect_printer();
 }
 
@@ -201,4 +294,66 @@ TEST_CASE("destroying an agent mid-connect does not hang or crash", "[OrcaPrinte
         agent.reset();   // ~OrcaPrinterAgent must stop the conn, join the thread, and not hang/crash
     }
     SUCCEED();
+}
+
+// OPCP spec §7.8: Bambu wire conventions must be decoded at the agent funnel,
+// never smuggled through as numeric lanes (an external-spool select once read
+// as slot_id=0 and physically loaded gate 0).
+TEST_CASE("OrcaPrinterAgent rewrites Bambu ams_* payloads onto the canonical OrcaSonar bodies", "[OrcaPrinterAgent]") {
+    auto canon = [](const std::string& dev, const std::string& in, bool* unsupported = nullptr) {
+        bool local = false;
+        return OrcaPrinterAgent::canonicalize_ams_payload(dev, in, unsupported ? unsupported : &local);
+    };
+
+    auto out = nlohmann::json::parse(canon("dev-c1",
+        R"({"print":{"command":"ams_change_filament","sequence_id":"1","target":5,"slot_id":1,"ams_id":1,"curr_temp":210,"tar_temp":220}})"));
+    CHECK(out["print"]["selector"] == "lane");
+    CHECK(out["print"]["lane"] == 5);
+    CHECK(!out["print"].contains("target"));
+    CHECK(!out["print"].contains("slot_id"));
+    CHECK(!out["print"].contains("ams_id"));
+    CHECK(out["print"]["tar_temp"] == 220);
+
+    // External-spool selection ("254" arrives hacked to 255 with slot_id=0):
+    // must become the selector op, never a lane.
+    out = nlohmann::json::parse(canon("dev-c1", R"({"print":{"command":"ams_change_filament","ams_id":255,"target":255,"slot_id":0}})"));
+    CHECK(out["print"]["selector"] == "external");
+    CHECK(!out["print"].contains("lane"));
+
+    out = nlohmann::json::parse(canon("dev-c1", R"({"print":{"command":"ams_change_filament","ams_id":0,"target":255,"slot_id":255}})"));
+    CHECK(out["print"]["selector"] == "unload");
+
+    out = nlohmann::json::parse(canon("dev-c1", R"({"print":{"command":"ams_change_filament","ams_id":1,"slot_id":2}})"));
+    CHECK(out["print"]["lane"] == 6);
+
+    out = nlohmann::json::parse(canon("dev-c1", R"({"print":{"command":"ams_filament_setting","ams_id":1,"slot_id":2,"tray_id":2,"tray_type":"PLA"}})"));
+    CHECK(out["print"]["lane"] == 6);
+    CHECK(out["print"]["tray_type"] == "PLA");
+
+    // Legacy RFID call shape (ams_id+slot_id, no tray_id) flattens to tray_id.
+    out = nlohmann::json::parse(canon("dev-c1", R"({"print":{"command":"ams_get_rfid","ams_id":1,"slot_id":2}})"));
+    CHECK(out["print"]["tray_id"] == 6);
+    CHECK(!out["print"].contains("ams_id"));
+
+    const std::string canonical = R"({"print":{"command":"ams_change_filament","selector":"lane","lane":3}})";
+    CHECK(canon("dev-c1", canonical) == canonical);
+    CHECK(canon("dev-c1", R"({"print":{"command":"pause"}})") == R"({"print":{"command":"pause"}})");
+    CHECK(canon("dev-c1", "not json at all") == "not json at all");
+
+    // Declared ams_ops gate at the client: only change_filament is supported.
+    Slic3r::register_ams_ops("dev-c2", {"change_filament"});
+    bool unsupported = false;
+    canon("dev-c2", R"({"print":{"command":"ams_change_filament","target":255,"slot_id":255}})", &unsupported);
+    CHECK(unsupported);
+    unsupported = false;
+    canon("dev-c2", R"({"print":{"command":"ams_control","param":"pause"}})", &unsupported);
+    CHECK(unsupported);
+    unsupported = false;
+    canon("dev-c2", R"({"print":{"command":"ams_change_filament","target":1}})", &unsupported);
+    CHECK(!unsupported);
+
+    // A device with no capabilities record is never gated (server backstops).
+    unsupported = false;
+    canon("dev-c3", R"({"print":{"command":"ams_user_setting","ams_id":0}})", &unsupported);
+    CHECK(!unsupported);
 }

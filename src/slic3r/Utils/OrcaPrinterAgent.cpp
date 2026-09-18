@@ -1,5 +1,6 @@
 #include "OrcaPrinterAgent.hpp"
 #include "OrcaCloudSignalingChannel.hpp"
+#include "AmsPayload.hpp"
 #include "Http.hpp"
 #include "IPrinterAgent.hpp"
 #include "NetworkAgentFactory.hpp"
@@ -448,6 +449,15 @@ OrcaPrinterAgent::~OrcaPrinterAgent()
     start_discovery(false, false);
     ++m_lan_generation; // fence any late worker callback
     ++m_cloud_generation;
+    {
+        std::lock_guard<std::mutex> lock(state_mutex);
+        m_shutting_down = true; // workers stop arming new HTTP fetches
+    }
+
+    // Drain the detached filament-refresh workers: the flag and generation bump
+    // above end their loops, so this waits at most one in-flight HTTP fetch.
+    while (m_filament_in_flight.load() > 0)
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
 
     // Drop the cloud status callback before anything else: it holds `this`, and the
     // cloud agent outlives the printer agent (NetworkAgent::set_printer_agent swaps
@@ -541,7 +551,7 @@ std::string OrcaPrinterAgent::merge_capabilities(const std::string& dev_id, cons
     // removes its storage too. Process-wide and keyed by the globally-unique
     // dev_id, with its own mutex; C++11 makes the one-time init thread-safe.
     static std::unordered_map<std::string, double> nozzle_diameter_cache;
-    static std::mutex                              nozzle_diameter_cache_mutex;
+    static std::mutex nozzle_diameter_cache_mutex;
 
     bool modified = false;
 
@@ -557,7 +567,7 @@ std::string OrcaPrinterAgent::merge_capabilities(const std::string& dev_id, cons
     //                ("N/A" -> NozzleType::ntUndefine, as MoonrakerPrinterAgent
     //                does; Klipper has no Bambu nozzle type) onto later push_status
     //                frames that carry no real nozzle data.
-    const auto info_it = envelope.find("info");
+    const auto info_it               = envelope.find("info");
     const bool is_capabilities_reply = info_it != envelope.end() && info_it->is_object() &&
                                        info_it->value("command", "") == "get_capabilities";
 
@@ -590,13 +600,46 @@ std::string OrcaPrinterAgent::merge_capabilities(const std::string& dev_id, cons
             std::lock_guard<std::mutex> l(nozzle_diameter_cache_mutex);
             nozzle_diameter_cache[dev_id] = nozzle_dia;
         }
-        // The capabilities reply itself is forwarded unchanged.
-    }
-    else {
-        const auto print_it = envelope.find("print");
-        if (print_it != envelope.end() && print_it->is_object() &&
-            print_it->value("command", "") == "push_status" && !print_it->contains("nozzle_diameter")) {
+        // The capabilities reply itself is forwarded unchanged. Its declared
+        // ams_ops (OPCP §7.8) gate every AMS control, and protocol.features.fms
+        // declares whether a material system actually exists.
+        {
+            const auto caps_it = info_it->find("capabilities");
+            if (caps_it != info_it->end() && caps_it->is_object()) {
+                const auto proto_it = caps_it->find("protocol");
+                if (proto_it != caps_it->end() && proto_it->is_object()) {
+                    const auto ops_it = proto_it->find("ams_ops");
+                    std::vector<std::string> ops;
+                    if (ops_it != proto_it->end() && ops_it->is_array()) {
+                        for (const auto& op : *ops_it)
+                            if (op.is_string())
+                                ops.push_back(op.get<std::string>());
+                        register_ams_ops(dev_id, ops);
+                    }
 
+                    // features.fms is the authoritative "has a material system"
+                    // flag (topology.material_units non-empty). Payloads without
+                    // it fall back to a non-empty ams_ops.
+                    bool has_ams           = false;
+                    bool fms_known         = false;
+                    const auto features_it = proto_it->find("features");
+                    if (features_it != proto_it->end() && features_it->is_object()) {
+                        const auto fms_it = features_it->find("fms");
+                        if (fms_it != features_it->end() && fms_it->is_boolean()) {
+                            has_ams   = fms_it->get<bool>();
+                            fms_known = true;
+                        }
+                    }
+                    if (!fms_known)
+                        has_ams = !ops.empty();
+                    register_ams_capability(dev_id, has_ams);
+                }
+            }
+        }
+    } else {
+        const auto print_it = envelope.find("print");
+        if (print_it != envelope.end() && print_it->is_object() && print_it->value("command", "") == "push_status" &&
+            !print_it->contains("nozzle_diameter")) {
             double nozzle_dia = 0.0;
             {
                 std::lock_guard<std::mutex> l(nozzle_diameter_cache_mutex);
@@ -607,7 +650,7 @@ std::string OrcaPrinterAgent::merge_capabilities(const std::string& dev_id, cons
             if (nozzle_dia > 0.0) {
                 (*print_it)["nozzle_diameter"] = nozzle_dia;
                 (*print_it)["nozzle_type"]     = "N/A";
-                modified = true;
+                modified                       = true;
             }
         }
     }
@@ -618,6 +661,11 @@ std::string OrcaPrinterAgent::merge_capabilities(const std::string& dev_id, cons
 
 void OrcaPrinterAgent::deliver_to_sink(const std::string& dev_id, const std::string& payload, bool local)
 {
+    // Subscription doorbell, on the raw payload before the UI marshal so the
+    // (possibly blocking) lane_data refresh never queues behind it.
+    if (local && filament_doorbell_needed(dev_id, payload))
+        request_filament_refresh(dev_id);
+
     parse_ipcam_info(dev_id, payload);
     std::string merged_payload = merge_capabilities(dev_id, payload);
 
@@ -629,10 +677,11 @@ void OrcaPrinterAgent::deliver_to_sink(const std::string& dev_id, const std::str
         q  = queue_on_main_fn;
     }
     BOOST_LOG_TRIVIAL(info) << "Orca diagnostic: delivering " << (local ? "local" : "cloud") << " report payload dev_id=" << dev_id
-                            << " payload=" << merged_payload
-                            << " callback=" << (fn ? "set" : "null") << " queue_on_main=" << (q ? "set" : "null");
+                            << " payload=" << merged_payload << " callback=" << (fn ? "set" : "null")
+                            << " queue_on_main=" << (q ? "set" : "null");
     if (!fn) {
-        BOOST_LOG_TRIVIAL(warning) << "Orca diagnostic: dropping " << (local ? "local" : "cloud") << " message because on_message_fn is not set"
+        BOOST_LOG_TRIVIAL(warning) << "Orca diagnostic: dropping " << (local ? "local" : "cloud")
+                                   << " message because on_message_fn is not set"
                                    << " dev_id=" << dev_id;
         return;
     }
@@ -654,6 +703,20 @@ void OrcaPrinterAgent::dispatch_local_connect(int state, const std::string& dev_
 
     BOOST_LOG_TRIVIAL(info) << "Orca diagnostic: LAN connection callback state=" << state << " dev_id=" << dev_id << " message=" << message
                             << " callback=" << (callback ? "set" : "null") << " queue_on_main=" << (queue ? "set" : "null");
+
+    // Eager filament sync on every (re)connect, like the Moonraker agents: the
+    // cached DevFilaSystem may predate the drop. The doorbell cache resets too,
+    // so the post-connect frame re-arms if the lane content moved meanwhile.
+    // Runs before the callback check so it also fires when no GUI listener is
+    // installed yet.
+    if (state == ConnectStatusOk) {
+        {
+            std::lock_guard<std::mutex> lock(state_mutex);
+            m_material_hash.clear();
+        }
+        request_filament_refresh(dev_id);
+    }
+
     if (!callback)
         return;
 
@@ -745,7 +808,9 @@ int OrcaPrinterAgent::command_ams_select_tray(std::string dev_id, std::string tr
     nlohmann::json j;
     j["print"]["command"]     = "ams_change_filament";
     j["print"]["sequence_id"] = std::to_string(sequence_id);
-    j["print"]["target"]      = tray_number;
+    // tray_id here is the flat global lane (DevFilaSystem slot index).
+    j["print"]["selector"] = "lane";
+    j["print"]["lane"]     = tray_number;
     return route_send(lan_mode, dev_id, j.dump());
 }
 
@@ -841,6 +906,240 @@ int OrcaPrinterAgent::command_axis_control(std::string dev_id,
     j["print"]["dir"]         = direction;
     j["print"]["distance"]    = requested_distance < 0.0 ? -requested_distance : requested_distance;
     return route_send(lan_mode, dev_id, j.dump());
+}
+
+FilamentSyncMode OrcaPrinterAgent::get_filament_sync_mode() const
+{
+    std::string dev_id;
+    {
+        std::lock_guard<std::mutex> lock(state_mutex);
+        dev_id = (m_current_connection == LAN) ? m_lan_dev_id : selected_machine;
+    }
+    if (!dev_id.empty() && has_ams_capability(dev_id)) {
+        return FilamentSyncMode::subscription;
+    }
+    return FilamentSyncMode::none;
+}
+
+bool OrcaPrinterAgent::fetch_filament_info(std::string dev_id, FilamentSyncMode sync_mode)
+{
+    if (sync_mode != get_filament_sync_mode())
+        return false;
+    return fetch_lane_data(dev_id) == LaneDataState::synced;
+}
+
+// Read the lane_data projection once and apply the REQ-STS-007 tri-state to
+// DevFilaSystem. Only LaneDataState::error arms the retry latch: 404 means
+// "not knowable yet" (pre-bootstrap or acknowledged-unknown topology) and {}
+// means "authoritatively no lanes" — both are settled states, and a printer
+// without a material system must not turn into a per-frame 404 poll.
+OrcaPrinterAgent::LaneDataState OrcaPrinterAgent::fetch_lane_data(const std::string& dev_id)
+{
+    std::string origin;
+    QueueOnMainFn queue_fn;
+    {
+        std::lock_guard<std::mutex> lock(state_mutex);
+        if (m_shutting_down || m_current_connection != LAN || m_lan_dev_id != dev_id)
+            return LaneDataState::unknown;
+        origin   = m_lan_http_origin;
+        queue_fn = queue_on_main_fn;
+    }
+    if (origin.empty())
+        return LaneDataState::unknown;
+    const std::string api_key = lan_api_key(origin);
+
+    // OrcaSonar serves the canonical topology's lane projection on its
+    // Moonraker-compatible façade. Called on the refresh worker (subscription
+    // mode), so the payload mutation is marshalled onto the main thread through
+    // queue_fn; a GUI-thread caller reads DevFilaSystem inline.
+    const std::string url = origin + "/server/database/item?namespace=lane_data";
+
+    std::string response_body;
+    unsigned http_status = 0;
+    bool transport_error = false;
+    std::string http_error;
+    auto http = Http::get(url);
+    if (!api_key.empty())
+        http.header("X-Api-Key", api_key);
+    http.timeout_connect(5)
+        .timeout_max(10)
+        .on_complete([&](std::string body, unsigned status) {
+            http_status = status;
+            if (status == 200) {
+                response_body = std::move(body);
+            } else {
+                http_error = "HTTP error: " + std::to_string(status);
+            }
+        })
+        .on_error([&](std::string, std::string err, unsigned status) {
+            transport_error = true;
+            http_status     = status;
+            http_error      = err;
+            if (status > 0)
+                http_error += " (HTTP " + std::to_string(status) + ")";
+        })
+        .perform_sync();
+
+    if (http_status == 404 && !transport_error) {
+        BOOST_LOG_TRIVIAL(info) << "OrcaPrinterAgent::fetch_lane_data: lane_data not served yet (unknown topology)";
+        return LaneDataState::unknown;
+    }
+    if (http_status != 200) {
+        BOOST_LOG_TRIVIAL(info) << "OrcaPrinterAgent::fetch_lane_data: lane_data fetch failed: " << http_error;
+        return LaneDataState::error;
+    }
+
+    auto json = nlohmann::json::parse(response_body, nullptr, false, true);
+    if (json.is_discarded()) {
+        BOOST_LOG_TRIVIAL(warning) << "OrcaPrinterAgent::fetch_lane_data: invalid lane_data JSON";
+        return LaneDataState::error;
+    }
+    const bool empty_value = json.is_object() && json.contains("result") && json["result"].is_object() &&
+                             json["result"].contains("value") && json["result"]["value"].is_object() && json["result"]["value"].empty();
+    if (empty_value) {
+        // Authoritative empty: flush stale trays so a removed AMS does not
+        // linger in the device panel.
+        clear_ams_payload_for_device(dev_id, queue_fn);
+        return LaneDataState::none;
+    }
+
+    std::vector<AmsTrayData> trays;
+    int max_lane_index = 0;
+    if (!parse_moonraker_lane_data(json, trays, max_lane_index))
+        return LaneDataState::error;
+
+    const int ams_count = (max_lane_index + 4) / 4;
+    // printer_type stays unset: push_status already carries the OrcaSonar printer
+    // type, and overwriting it here would clear it. build_ams_payload_for_device
+    // marshals the DevFilaSystem mutation through queue_fn when set.
+    build_ams_payload_for_device(dev_id, std::nullopt, ams_count, max_lane_index, trays, queue_fn);
+    return LaneDataState::synced;
+}
+
+// Subscription scheduler for filament sync. A single detached worker drains
+// m_filament_wanted; extra requests arriving while it runs fold into its loop, so
+// a burst of topology_state doorbells costs one extra fetch that picks up the
+// trailing change. A failed fetch does not busy-retry: m_filament_failed makes
+// the next inbound LAN frame request again (an idle printer is silent, but it
+// cannot have changed lanes either), and a reconnect re-primes via the
+// ConnectStatusOk path in dispatch_local_connect().
+void OrcaPrinterAgent::request_filament_refresh(const std::string& dev_id)
+{
+    uint64_t gen;
+    {
+        std::lock_guard<std::mutex> lock(state_mutex);
+        if (m_current_connection != LAN || m_lan_dev_id != dev_id)
+            return;
+        gen               = m_lan_generation.load();
+        m_filament_wanted = true;
+        if (m_filament_working)
+            return; // the running worker will take the flag
+        m_filament_working = true;
+    }
+
+    m_filament_in_flight.fetch_add(1, std::memory_order_relaxed);
+    std::thread([this, dev_id, gen] {
+        struct InFlightGuard
+        {
+            std::atomic<int>& counter;
+            ~InFlightGuard() { counter.fetch_sub(1, std::memory_order_relaxed); }
+        } guard{m_filament_in_flight};
+
+        for (;;) {
+            bool needed;
+            {
+                std::lock_guard<std::mutex> lock(state_mutex);
+                needed = !m_shutting_down && m_filament_wanted && m_lan_generation.load() == gen && m_current_connection == LAN &&
+                         m_lan_dev_id == dev_id;
+                if (needed)
+                    m_filament_wanted = false;
+                else
+                    m_filament_working = false; // same critical section that saw no work: no lost wake-up
+            }
+            if (!needed)
+                return;
+            const auto state = fetch_lane_data(dev_id);
+            std::lock_guard<std::mutex> lock(state_mutex);
+            m_filament_failed = state == LaneDataState::error; // latch read by filament_doorbell_needed()
+        }
+    }).detach();
+}
+
+// A LAN frame is a refresh trigger when it carries an OrcaSonar material
+// change (a new print.topology_state.material_hash, spec REQ-STS-007 §7.7) or
+// when the last fetch errored and this frame is the retry beat. The substring
+// guard keeps the JSON parse off the steady temp-tick cadence, and hash
+// equality absorbs the tick's topology_state re-emissions.
+bool OrcaPrinterAgent::filament_doorbell_needed(const std::string& dev_id, const std::string& payload)
+{
+    {
+        std::lock_guard<std::mutex> lock(state_mutex);
+        if (m_current_connection != LAN || m_lan_dev_id != dev_id)
+            return false;
+        if (m_filament_failed)
+            return true;
+    }
+    // The cheap guard is the §7.7 doorbell token itself, so the steady
+    // temperature-only tick never reaches the JSON parse.
+    if (payload.find("material_hash") == std::string::npos)
+        return false;
+    auto json = nlohmann::json::parse(payload, nullptr, false);
+    if (json.is_discarded() || !json.is_object())
+        return false;
+    const auto print_it = json.find("print");
+    if (print_it == json.end() || !print_it->is_object())
+        return false;
+    const auto topo_it = print_it->find("topology_state");
+    if (topo_it == print_it->end() || !topo_it->is_object())
+        return false;
+    const auto hash_it = topo_it->find("material_hash");
+    if (hash_it == topo_it->end() || !hash_it->is_string())
+        return false;
+
+    std::lock_guard<std::mutex> lock(state_mutex);
+    if (hash_it->get<std::string>() == m_material_hash)
+        return false; // content unchanged: not a doorbell
+    m_material_hash = hash_it->get<std::string>();
+    return true;
+}
+
+// Moonraker's client bootstrap: /access/api_key hands the façade key to a
+// trusted source (the default LAN ranges include the slicer). Cache it per
+// connection generation. If the request is refused — a hardened trusted_clients
+// list, or no façade — fall back to the access code, which is what earlier
+// builds sent, so behavior degrades to the status quo rather than breaking.
+std::string OrcaPrinterAgent::lan_api_key(const std::string& origin)
+{
+    if (origin.empty())
+        return {};
+
+    std::string fallback;
+    uint64_t gen;
+    {
+        std::lock_guard<std::mutex> lock(state_mutex);
+        if (!m_lan_api_key.empty() && m_lan_api_key_gen == m_lan_generation.load())
+            return m_lan_api_key;
+        fallback = m_lan_password;
+        gen      = m_lan_generation.load();
+    }
+
+    std::string resolved;
+    if (std::string body; fetch_orcasonar_body(origin + "/access/api_key", body)) {
+        auto j = nlohmann::json::parse(body, nullptr, false, true);
+        if (!j.is_discarded() && j.contains("result") && j["result"].is_string())
+            resolved = j["result"].get<std::string>();
+    }
+    if (resolved.empty()) {
+        BOOST_LOG_TRIVIAL(info) << "OrcaPrinterAgent: /access/api_key unavailable; using the access code as X-Api-Key";
+        resolved = fallback;
+    }
+
+    std::lock_guard<std::mutex> lock(state_mutex);
+    if (m_lan_generation.load() == gen && !resolved.empty()) {
+        m_lan_api_key     = resolved;
+        m_lan_api_key_gen = gen;
+    }
+    return resolved;
 }
 
 bool OrcaPrinterAgent::parse_lan_endpoint(const std::string& dev_ip, std::string& host, std::string& port)
@@ -1040,9 +1339,13 @@ int OrcaPrinterAgent::connect_printer(std::string dev_id, std::string dev_ip, st
     CurrentConn previous_connection;
     {
         std::lock_guard<std::mutex> l(state_mutex);
-        previous_connection  = m_current_connection;
-        m_lan_dev_id         = dev_id;
-        m_lan_url            = cfg.url;
+        previous_connection = m_current_connection;
+        m_lan_dev_id        = dev_id;
+        m_lan_url           = cfg.url;
+        m_lan_http_origin   = http_origin_from_lan_ws(cfg.url);
+        m_lan_password      = password; // access code; the façade key is bootstrapped lazily
+        m_lan_api_key.clear();
+        m_lan_api_key_gen    = gen;
         m_camera_stream_mode = CameraStreamMode::none;
         m_camera_url.clear();
         m_current_connection = LAN;
@@ -1116,6 +1419,10 @@ int OrcaPrinterAgent::disconnect_printer()
         doomed              = std::move(lan_mqtt_connection);
         prev_dev            = m_lan_dev_id;
         m_lan_dev_id.clear();
+        m_lan_http_origin.clear();
+        m_lan_api_key.clear();
+        m_filament_wanted = false; // a stale worker self-exits on the generation mismatch
+        m_filament_failed = false;
         if (m_current_connection == LAN) {
             m_current_connection = NONE;
             m_camera_stream_mode = CameraStreamMode::none;
@@ -1145,11 +1452,107 @@ int OrcaPrinterAgent::disconnect_printer()
 int OrcaPrinterAgent::send_message_to_printer(std::string dev_id, std::string json_str, int /*qos*/, int /*flag*/)
 { return route_send(/*is_lan=*/true, dev_id, json_str); }
 
+// Rewrite Bambu-convention print.ams_* payloads onto the canonical OrcaSonar
+// bodies (OPCP spec §7.8) and enforce the device's declared ams_ops. DevFilaSystem
+// is built from flat lane indices, so the Bambu encodings the shared
+// MachineObject command builders emit — ams_id/slot_id 4-tray pseudo-groups,
+// virtual tray ids 254/255 — are decoded here, at the single funnel all print
+// commands cross, and never reach the server. A command whose op token the
+// device did not declare short-circuits as *unsupported (CAP_NOT_AVAILABLE),
+// which publish_json already renders as the friendly unsupported dialog.
+std::string OrcaPrinterAgent::canonicalize_ams_payload(const std::string& dev_id, const std::string& json_str, bool* unsupported)
+{
+    if (unsupported)
+        *unsupported = false;
+    try {
+        auto envelope = nlohmann::json::parse(json_str, nullptr, false);
+        if (envelope.is_discarded() || !envelope.is_object() || !envelope.contains("print") || !envelope["print"].is_object())
+            return json_str;
+        auto& print           = envelope["print"];
+        const std::string cmd = print.value("command", std::string());
+        if (cmd.empty() || (cmd.rfind("ams_", 0) != 0 && cmd != "auto_stop_ams_dry"))
+            return json_str;
+        if (cmd == "ams_change_filament" && print.contains("selector"))
+            return json_str; // already canonical (e.g. command_ams_select_tray)
+
+        auto int_or = [&print](const char* key, int fallback) {
+            const auto it = print.find(key);
+            return (it != print.end() && it->is_number_integer()) ? it->get<int>() : fallback;
+        };
+        std::string op;
+        if (cmd == "ams_change_filament") {
+            const int target = int_or("target", -1);
+            const int slot   = int_or("slot_id", -1);
+            const int ams    = int_or("ams_id", -1);
+            print.erase("target");
+            print.erase("slot_id");
+            print.erase("tray_id");
+            print.erase("ams_id");
+            if (target == 255 && slot == 255) {
+                print["selector"] = "unload";
+                op                = "unload";
+            } else if (target == 255 || ams == 254 || ams == 255) {
+                print["selector"] = "external";
+                op                = "external";
+            } else {
+                const int lane    = target >= 0 ? target : (ams >= 0 ? ams * 4 + slot : slot);
+                print["selector"] = "lane";
+                print["lane"]     = lane;
+                op                = "change_filament";
+            }
+        } else if (cmd == "ams_filament_setting") {
+            const int ams  = int_or("ams_id", -1);
+            const int slot = int_or("slot_id", -1);
+            op             = "filament_setting";
+            if (ams >= 254) {
+                if (unsupported)
+                    *unsupported = true; // no lane for a virtual tray
+                return json_str;
+            }
+            print["lane"] = ams * 4 + slot;
+            print.erase("slot_id");
+            print.erase("tray_id");
+            print.erase("ams_id");
+        } else if (cmd == "ams_control") {
+            std::string action = print.value("action", print.value("param", std::string()));
+            op                 = action; // only "pause" is ever declared; the rest gate out
+        } else if (cmd == "ams_user_setting") {
+            op = "user_setting";
+        } else if (cmd == "ams_get_rfid") {
+            op = "get_rfid";
+            if (!print.contains("tray_id")) {
+                const int ams  = int_or("ams_id", -1);
+                const int slot = int_or("slot_id", -1);
+                if (ams >= 0 && slot >= 0) {
+                    print["tray_id"] = ams * 4 + slot; // legacy ams+slot call shape
+                    print.erase("ams_id");
+                    print.erase("slot_id");
+                }
+            }
+        } else if (cmd == "auto_stop_ams_dry") {
+            op = "stop_dry";
+        }
+        if (!op.empty() && !ams_op_supported(dev_id, op)) {
+            if (unsupported)
+                *unsupported = true;
+        }
+        return envelope.dump();
+    } catch (const std::exception&) {
+        return json_str;
+    }
+}
+
 int OrcaPrinterAgent::route_send(bool is_lan, const std::string& dev_id, const std::string& json_str)
 {
+    bool unsupported            = false;
+    const std::string canonical = canonicalize_ams_payload(dev_id, json_str, &unsupported);
+    if (unsupported) {
+        BOOST_LOG_TRIVIAL(info) << "OrcaPrinterAgent::route_send: ams op not declared by device capabilities, dev_id=" << dev_id;
+        return ORCA_NETWORK_ERR_CAP_NOT_AVAILABLE;
+    }
     std::string command = "<unparsed>";
     try {
-        const nlohmann::json envelope = nlohmann::json::parse(json_str);
+        const nlohmann::json envelope = nlohmann::json::parse(canonical);
         for (const char* namespace_name : {"pushing", "info", "print", "system", "camera", "xcam", "upgrade", "event", "files"}) {
             const auto namespace_it = envelope.find(namespace_name);
             if (namespace_it != envelope.end() && namespace_it->is_object()) {
@@ -1171,7 +1574,7 @@ int OrcaPrinterAgent::route_send(bool is_lan, const std::string& dev_id, const s
     OrcaMqttConnection* conn = get_appropriate_mqtt_connection(is_lan);
     if (!conn)
         return BAMBU_NETWORK_ERR_INVALID_HANDLE;
-    const bool queued = conn->send_request(dev_id, json_str);
+    const bool queued = conn->send_request(dev_id, canonical);
     BOOST_LOG_TRIVIAL(info) << "OrcaPrinterAgent::route_send command=" << command << " queued=" << queued << " is_lan=" << is_lan
                             << " dev_id=" << dev_id;
     return queued ? BAMBU_NETWORK_SUCCESS : BAMBU_NETWORK_ERR_CONNECTION_TO_SERVER_FAILED;
@@ -1345,9 +1748,9 @@ int OrcaPrinterAgent::set_user_selected_machine(std::string dev_id)
         auto state_handler = [this](bool connected, bool initial) {
             if (!connected || initial)
                 return;
-            auto* current_cloud = get_orca_cloud_agent();
+            auto* current_cloud              = get_orca_cloud_agent();
             OrcaMqttConnection* current_conn = current_cloud ? current_cloud->get_mqtt_connection() : nullptr;
-            const std::string selected = get_user_selected_machine();
+            const std::string selected       = get_user_selected_machine();
             if (current_conn && !selected.empty())
                 on_connected(selected, current_conn, m_cloud_generation.load());
         };
@@ -1370,7 +1773,8 @@ AgentInfo OrcaPrinterAgent::get_agent_info_static()
 // Print Job Operations - All Stubs
 // ============================================================================
 
-// Simply uploads the file to the printer via HTTP (cloud) then sends a HTTP request to start print. In the future, this might be a MQTT command to start print instead of HTTP.
+// Simply uploads the file to the printer via HTTP (cloud) then sends a HTTP request to start print. In the future, this might be a MQTT
+// command to start print instead of HTTP.
 int OrcaPrinterAgent::start_print(PrintParams params, OnUpdateStatusFn update_fn, WasCancelledFn cancel_fn, OnWaitFn wait_fn)
 {
     (void) wait_fn;
@@ -1476,37 +1880,49 @@ int OrcaPrinterAgent::start_send_gcode_to_sdcard(PrintParams params,
     std::string http_error;
     std::string response_body;
 
+    // One façade key for the whole upload exchange (directory probe + POST).
+    // If the bootstrapped key is unavailable (and there was no stored access
+    // code), fall back to the job's own password rather than sending none.
+    std::string api_key = lan_api_key(origin);
+    if (api_key.empty())
+        api_key = params.password;
+
     // check if printer has enough storage
-    Http::get(origin + "/server/files/directory?path=gcodes")
-        .on_complete([&](std::string body, unsigned status) {
-            if (body.empty()) {
-                http_status = 400;
-                http_error  = "Failed to get gcodes directory.";
-            }
-
-            int free = 0;
-
-            nlohmann::json json = nlohmann::json::parse(body);
-            if (json.contains("result")) {
-                json = json["result"];
-                if (json.contains("disk_usage")) {
-                    json = json["disk_usage"];
-                    if (json.contains("free"))
-                        free = json["free"].get<int>();
+    {
+        auto dir_req = Http::get(origin + "/server/files/directory?path=gcodes");
+        if (!api_key.empty())
+            dir_req.header("X-Api-Key", api_key);
+        dir_req
+            .on_complete([&](std::string body, unsigned status) {
+                if (body.empty()) {
+                    http_status = 400;
+                    http_error  = "Failed to get gcodes directory.";
                 }
-            }
 
-            if (free < file_size) {
-                http_status = 507;
-                http_error  = "Not enough storage on the printer.";
-            }
-        })
-        .on_error([&](std::string body, std::string err, unsigned status) {
-            http_status   = status;
-            http_error    = std::move(err);
-            response_body = std::move(body);
-        })
-        .perform_sync();
+                int free = 0;
+
+                nlohmann::json json = nlohmann::json::parse(body);
+                if (json.contains("result")) {
+                    json = json["result"];
+                    if (json.contains("disk_usage")) {
+                        json = json["disk_usage"];
+                        if (json.contains("free"))
+                            free = json["free"].get<int>();
+                    }
+                }
+
+                if (free < file_size) {
+                    http_status = 507;
+                    http_error  = "Not enough storage on the printer.";
+                }
+            })
+            .on_error([&](std::string body, std::string err, unsigned status) {
+                http_status   = status;
+                http_error    = std::move(err);
+                response_body = std::move(body);
+            })
+            .perform_sync();
+    }
 
     if (http_status >= 400) {
         BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << " failed with error code: " << http_status << ", " << http_error;
@@ -1514,8 +1930,8 @@ int OrcaPrinterAgent::start_send_gcode_to_sdcard(PrintParams params,
     }
 
     auto http = Http::post(origin + "/server/files/upload");
-    if (!params.password.empty())
-        http.header("X-Api-Key", params.password); // trusted LAN facades may not require it; harmless when they do not
+    if (!api_key.empty())
+        http.header("X-Api-Key", api_key); // bootstrapped façade key, or the access code fallback
     http.form_add("root", "gcodes")
         .form_add("print", "false")
         .form_add_file("file", source, upload_name)

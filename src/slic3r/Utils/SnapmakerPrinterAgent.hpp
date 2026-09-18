@@ -6,6 +6,7 @@
 #include <atomic>
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace Slic3r {
 
@@ -27,6 +28,12 @@ public:
 private:
     // Combine filament_type + filament_sub_type into a unified type string
     static std::string combine_filament_type(const std::string& type, const std::string& sub_type);
+
+    // Resolve tray_info_idx for the collected trays. Reads the GUI preset
+    // bundle, so it is invoked on the main thread from within the shared
+    // build_ams_payload_for_device() (never on the fetch worker).
+    static void resolve_snapmaker_tray_info(std::vector<AmsTrayData>& trays,
+                                            const std::vector<std::string>& vendors);
 
     void start_camera_monitor();
     void on_status_loop_tick(const std::string& dev_id) override;

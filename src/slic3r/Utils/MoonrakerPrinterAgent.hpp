@@ -3,6 +3,7 @@
 
 #include "IPrinterAgent.hpp"
 #include "ICloudServiceAgent.hpp"
+#include "AmsPayload.hpp"
 
 #include <memory>
 #include <mutex>
@@ -84,19 +85,12 @@ protected:
         bool        use_ssl = false;
     } device_info;
 
-    // Tray data for AMS payload building
-    struct AmsTrayData {
-        int         slot_index = 0;      // 0-based slot index
-        bool        has_filament = false;
-        std::string tray_type;           // Material type (e.g., "PLA", "ASA")
-        std::string tray_color;          // Raw color (#RRGGBB, 0xRRGGBB, or RRGGBBAA)
-        std::string tray_info_idx;       // Setting ID (optional)
-        int         bed_temp = 0;        // Optional
-        int         nozzle_temp = 0;     // Optional
-    };
-
-    // Build ams JSON and call parser
+    // Build ams JSON and call parser (AmsTrayData is shared; see AmsPayload.hpp).
     void build_ams_payload(int ams_count, int max_lane_index, const std::vector<AmsTrayData>& trays);
+    // Overload for agents with vendor-aware matching (Snapmaker): the resolver
+    // runs on the main thread inside the shared builder, preserving the match
+    // without touching preset state on the fetch worker.
+    void build_ams_payload(int ams_count, int max_lane_index, const std::vector<AmsTrayData>& trays, const TrayInfoResolver& vendor_resolver);
 
     // Methods that derived classes may need to override or access
     virtual bool init_device_info(std::string dev_id, std::string dev_ip, std::string username, std::string password, bool use_ssl);
@@ -120,9 +114,6 @@ protected:
 
     // Trim whitespace and convert to uppercase
     static std::string trim_and_upper(const std::string& input);
-
-    // Map filament type to OrcaFilamentLibrary preset ID for AMS sync compatibility
-    static std::string map_filament_type_to_generic_id(const std::string& filament_type);
 
     // Send a G-code script via Moonraker (/printer/gcode/script)
     bool send_gcode(const std::string& dev_id, const std::string& gcode) const;
@@ -188,11 +179,8 @@ private:
     bool fetch_moonraker_filament_data(std::vector<AmsTrayData>& trays, int& max_lane_index);
 
     // JSON helper methods
-    static std::string safe_json_string(const nlohmann::json& obj, const char* key);
-    static int safe_json_int(const nlohmann::json& obj, const char* key);
     static std::string safe_array_string(const nlohmann::json& arr, int idx);
     static int safe_array_int(const nlohmann::json& arr, int idx);
-    static std::string normalize_color_value(const std::string& color);
 
     std::string                        ssdp_announced_host;
     std::string                        ssdp_announced_id;

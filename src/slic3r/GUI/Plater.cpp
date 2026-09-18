@@ -727,6 +727,7 @@ struct Sidebar::priv
     ScalableButton *  m_bpButton_add_filament;
     ScalableButton *  m_bpButton_del_filament;
     ScalableButton *  m_bpButton_ams_filament;
+    bool              m_ams_sync_button_show{true}; // last applied AMS sync button visibility
     ScalableButton *  m_bpButton_set_filament;
     int m_menu_filament_id = -1;
 
@@ -3427,6 +3428,22 @@ void Sidebar::remove_unused_filament_combos(const size_t current_extruder_count)
     }
 }
 
+void Sidebar::update_ams_sync_button()
+{
+    if (!p->m_bpButton_ams_filament || !wxGetApp().preset_bundle)
+        return;
+    // BBL printers always advertise AMS sync; other agents follow the active
+    // agent's filament sync mode, which flips to subscription only after the
+    // printer's get_capabilities reply arrives.
+    const bool show = wxGetApp().preset_bundle->use_bbl_network() ||
+                      (wxGetApp().getAgent() && wxGetApp().getAgent()->get_filament_sync_mode() != FilamentSyncMode::none);
+    if (p->m_ams_sync_button_show == show)
+        return;
+    p->m_ams_sync_button_show = show;
+    p->m_bpButton_ams_filament->Show(show);
+    p->m_bpButton_ams_filament->GetParent()->Layout();
+}
+
 void Sidebar::update_all_preset_comboboxes()
 {
     PresetBundle &preset_bundle = *wxGetApp().preset_bundle;
@@ -3444,7 +3461,7 @@ void Sidebar::update_all_preset_comboboxes()
         //p->btn_connect_printer->Hide();
         p->m_printer_connect->Hide();
         //only show sync-ams button for BBL printer
-        p->m_bpButton_ams_filament->Show();
+        update_ams_sync_button();
         //update print button default value for bbl or third-party printer
         p_mainframe->set_print_button_to_default(MainFrame::PrintSelectType::ePrintPlate);
     } else {
@@ -3453,11 +3470,7 @@ void Sidebar::update_all_preset_comboboxes()
         p->m_printer_connect->Show(!use_printer_agents);
 
         // ORCA: show/hide sync-ams button based on filament sync mode
-        auto agent = wxGetApp().getAgent();
-        if (agent && agent->get_filament_sync_mode() != FilamentSyncMode::none)
-            p->m_bpButton_ams_filament->Show();
-        else
-            p->m_bpButton_ams_filament->Hide();
+        update_ams_sync_button();
 
         // Orca: with "Support 3MF as gcode" (use_3mf) the local export is a .gcode.3mf bundle, so when no
         // printer host/IP is configured the default action is "Export plate sliced file" (mirrors the
@@ -22152,10 +22165,14 @@ void Plater::update_machine_sync_status()
     DeviceManager *dev_maneger = wxGetApp().getDeviceManager();
     if (!dev_maneger) {
         GUI::wxGetApp().sidebar().update_sync_status(nullptr);
+        GUI::wxGetApp().sidebar().update_ams_sync_button();
         return;
     }
     MachineObject *obj = wxGetApp().getDeviceManager()->get_selected_machine();
     GUI::wxGetApp().sidebar().update_sync_status(obj);
+    // The agent's sync mode flips once the printer's get_capabilities reply
+    // arrives; re-evaluate the filament-sync button on every device update.
+    GUI::wxGetApp().sidebar().update_ams_sync_button();
 }
 
 bool Plater::get_machine_sync_status()

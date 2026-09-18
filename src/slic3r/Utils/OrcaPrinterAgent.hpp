@@ -36,8 +36,7 @@ public:
     void set_cloud_agent(std::shared_ptr<ICloudServiceAgent> cloud) override;
     CameraStreamMode get_camera_stream_mode() const override;
     std::string get_camera_url() const override;
-    std::unique_ptr<ICameraSignalingChannel>
-    create_camera_signaling_channel(const std::string& dev_id) override;
+    std::unique_ptr<ICameraSignalingChannel> create_camera_signaling_channel(const std::string& dev_id) override;
 
     // Communication
     int send_message(std::string dev_id, std::string json_str, int qos, int flag) override;
@@ -100,6 +99,14 @@ public:
                              int sequence_id,
                              bool lan_mode) override;
 
+    // Filament sync (subscription): `subscription` when the selected printer
+    // reports a material system (get_capabilities protocol.features.fms),
+    // `none` otherwise. The mode is transport-agnostic; the lane_data fetch and
+    // topology_state doorbell that keep DevFilaSystem fresh are LAN-only, and
+    // cloud printers get their AMS view from the mirrored push_status.
+    FilamentSyncMode get_filament_sync_mode() const override;
+    bool fetch_filament_info(std::string dev_id, FilamentSyncMode sync_mode = FilamentSyncMode::pull) override;
+
     // Test-only: drive emit_connect_sequence directly (no socket).
     void run_connect_sequence_for_test(const std::string& dev_id)
     {
@@ -111,7 +118,22 @@ public:
     // Test-only: the same for the (independent) cloud selection epoch.
     void bump_cloud_generation_for_test() { ++m_cloud_generation; }
 
-    FilamentSyncMode get_filament_sync_mode() const override { return FilamentSyncMode::subscription; }
+    // Test-only: observe the subscription doorbell policy without spawning the refresh worker.
+    bool filament_doorbell_needed_for_test(const std::string& dev_id, const std::string& payload)
+    {
+        return filament_doorbell_needed(dev_id, payload);
+    }
+    // Test-only: arm the fetch-failure latch (retry-on-next-LAN-frame rule).
+    void set_filament_failed_for_test(bool v)
+    {
+        std::lock_guard<std::mutex> lock(state_mutex);
+        m_filament_failed = v;
+    }
+    // Test-only: Bambu ams_* wire JSON -> canonical OrcaSonar bodies (§7.8).
+    // Returns the (possibly rewritten) payload; *unsupported is set when the
+    // device's declared ams_ops exclude the operation (CAP_NOT_AVAILABLE in
+    // the live route_send path).
+    static std::string canonicalize_ams_payload(const std::string& dev_id, const std::string& json_str, bool* unsupported);
 
 protected:
     // Forward one inbound printer message to on_message_fn or on_local_message_fn (marshalled onto the UI
@@ -191,10 +213,45 @@ private:
 
     std::unique_ptr<OrcaSonarDiscovery> m_discovery;
 
-    std::string m_lan_dev_id; // guarded by state_mutex
-    std::string m_lan_url;    // guarded by state_mutex — the Config.url of the live LAN session
+    std::string m_lan_dev_id;                                       // guarded by state_mutex
+    std::string m_lan_url;                                          // guarded by state_mutex — the Config.url of the live LAN session
+    std::string m_lan_http_origin;                                  // guarded by state_mutex — http(s) origin of the LAN façade
+    std::string m_lan_password;                                     // guarded by state_mutex — MQTT access code; X-Api-Key fallback
+    std::string m_lan_api_key;                                      // guarded by state_mutex — cached Moonraker-façade key, "" = unresolved
+    uint64_t m_lan_api_key_gen = 0;                                 // m_lan_generation the cached key belongs to
     CameraStreamMode m_camera_stream_mode = CameraStreamMode::none; // guarded by state_mutex
-    std::string m_camera_url; // guarded by state_mutex
+    std::string m_camera_url;                                       // guarded by state_mutex
+
+    // The Moonraker-façade X-Api-Key, bootstrapped from /access/api_key (trusted
+    // clients only) and cached per connection generation; falls back to the
+    // access code when the endpoint is unavailable (untrusted/hardened config).
+    std::string lan_api_key(const std::string& origin);
+
+    // Subscription-mode filament sync. One detached worker per burst drains
+    // m_filament_wanted by re-reading lane_data; doorbell frames (a pushed
+    // print.topology_state change) and the failure latch are the only triggers —
+    // no timer: an idle OrcaSonar emits no frames, and cannot change lanes either.
+    void request_filament_refresh(const std::string& dev_id);
+        // OPCP §7.7: the doorbell is a CHANGE in print.topology_state.material_hash
+    // (lane content only — tool temperature churn inside topology_state must not
+    // re-fetch); consuming a new value updates m_material_hash.
+    bool filament_doorbell_needed(const std::string& dev_id, const std::string& payload);
+
+    // Tri-state lane_data fetch outcome (REQ-STS-007 §7.7 read semantics):
+    //  synced  — 200 with lane entries, payload built;
+    //  none    — 200 with an empty value: authoritative "no lanes", AMS view cleared;
+    //  unknown — 404: topology not bootstrapped yet or material_units unknown;
+    //            never latched, the next doorbell or reconnect retries;
+    //  error   — transport/5xx: latched, retried on the next inbound frame.
+    enum class LaneDataState { synced, none, unknown, error };
+    LaneDataState fetch_lane_data(const std::string& dev_id);
+
+    bool m_filament_wanted  = false; // guarded by state_mutex; a fetch is pending
+    bool m_filament_working = false; // guarded by state_mutex; a worker owns the queue
+    bool m_filament_failed  = false; // guarded by state_mutex; retry-on-next-LAN-frame rule
+    bool m_shutting_down    = false; // guarded by state_mutex; workers stop taking fetches
+    std::string m_material_hash;     // guarded by state_mutex; last doorbell value seen
+    std::atomic<int> m_filament_in_flight{0}; // detached workers; drained by the destructor
 
     OrcaCloudServiceAgent* get_orca_cloud_agent();
 

@@ -239,25 +239,6 @@ bool SnapmakerPrinterAgent::fetch_filament_info(std::string dev_id, FilamentSync
                 tray.tray_type  = combine_filament_type(safe_at(filament_type, i, empty_str), safe_at(filament_sub_type, i, empty_str));
                 tray.tray_color = safe_at(filament_color, i, default_color);
 
-                auto* bundle = GUI::wxGetApp().preset_bundle;
-                // Try to find a matching preset for this filament based on vendor, type and color.
-                // If not found, default to traditional search by type only or generic type mapping.
-                if (bundle) {
-                    std::string vendor      = safe_at(filament_vendor, i, empty_str);
-                    std::string filament_id = find_closest_color_preset_by_vendor_and_type(bundle->filaments, vendor, tray.tray_type,
-                                                                                           tray.tray_color);
-
-                    if (!filament_id.empty()) {
-                        tray.tray_info_idx = filament_id;
-                        BOOST_LOG_TRIVIAL(warning)
-                            << "Filament sync: Found manufacturer-specific profile for slot " << i << ": " << filament_id;
-                    } else {
-                        tray.tray_info_idx = bundle->filaments.filament_id_by_type(tray.tray_type);
-                    }
-                } else {
-                    tray.tray_info_idx = map_filament_type_to_generic_id(tray.tray_type);
-                }
-
                 // Extract NFC temperature data if available
                 if (nfc_info.is_array() && i < static_cast<int>(nfc_info.size()) && nfc_info[i].is_object()) {
                     auto& nfc_slot     = nfc_info[i];
@@ -272,10 +253,44 @@ bool SnapmakerPrinterAgent::fetch_filament_info(std::string dev_id, FilamentSync
             trays.emplace_back(std::move(tray));
         }
 
-        build_ams_payload(1, slot_count - 1, trays);
+        // Preset matching (vendor + closest color) reads GUI preset state, so it
+        // runs on the main thread via this resolver, not on the fetch worker.
+        std::vector<std::string> vendors;
+        vendors.reserve(slot_count);
+        for (int i = 0; i < slot_count; ++i)
+            vendors.push_back(safe_at(filament_vendor, i, empty_str));
+
+        build_ams_payload(1, slot_count - 1, trays,
+            [vendors](std::vector<AmsTrayData>& resolved) { resolve_snapmaker_tray_info(resolved, vendors); });
     }).detach();
 
     return true;
+}
+
+void SnapmakerPrinterAgent::resolve_snapmaker_tray_info(std::vector<AmsTrayData>& trays,
+                                                        const std::vector<std::string>& vendors)
+{
+    auto* bundle = GUI::wxGetApp().preset_bundle;
+    for (auto& tray : trays) {
+        if (!tray.has_filament)
+            continue;
+        const std::string vendor = (tray.slot_index >= 0 && tray.slot_index < static_cast<int>(vendors.size()))
+                                       ? vendors[tray.slot_index]
+                                       : std::string();
+        if (bundle) {
+            // Try a matching preset by vendor, type and color; fall back to
+            // type only, then to the generic family map.
+            std::string filament_id = find_closest_color_preset_by_vendor_and_type(bundle->filaments, vendor, tray.tray_type, tray.tray_color);
+            if (!filament_id.empty()) {
+                tray.tray_info_idx = filament_id;
+                BOOST_LOG_TRIVIAL(warning) << "Filament sync: Found manufacturer-specific profile for slot " << tray.slot_index << ": " << filament_id;
+            } else {
+                tray.tray_info_idx = bundle->filaments.filament_id_by_type(tray.tray_type);
+            }
+        } else {
+            tray.tray_info_idx = map_filament_type_to_generic_id(tray.tray_type);
+        }
+    }
 }
 
 FilamentSyncMode SnapmakerPrinterAgent::get_filament_sync_mode() const

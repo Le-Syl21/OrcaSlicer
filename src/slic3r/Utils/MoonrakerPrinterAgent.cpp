@@ -533,142 +533,27 @@ int MoonrakerPrinterAgent::set_queue_on_main_fn(QueueOnMainFn fn)
 
 void MoonrakerPrinterAgent::build_ams_payload(int ams_count, int max_lane_index, const std::vector<AmsTrayData>& trays)
 {
-    // This may be called from a background thread (e.g. run_status_stream's read loop,
-    // for subscription-mode agents) as well as from the GUI thread (Sidebar's pull-mode
-    // path). Everything below touches MachineObject/DevFilaSystem, which the GUI thread
-    // reads without locking — so the actual mutation must run on the main thread. Snapshot
-    // queue_on_main_fn and the two device_info fields we need up front, then defer the rest,
-    // mirroring dispatch_message's existing queue_fn ? queue_fn(x) : x() idiom.
+    // May run from the status-stream thread (subscription agents) or the GUI
+    // thread (Sidebar's pull path). Snapshot queue_on_main_fn here; the shared
+    // builder defers the preset lookup and MachineObject mutation to the main
+    // thread. A heavy-handed empty model_id must still be assigned, so the
+    // optional wrapper always carries the value here.
     QueueOnMainFn queue_fn;
     {
         std::lock_guard<std::recursive_mutex> lock(state_mutex);
         queue_fn = queue_on_main_fn;
     }
+    build_ams_payload_for_device(device_info.dev_id, std::optional<std::string>(device_info.model_id), ams_count, max_lane_index, trays, queue_fn);
+}
 
-    std::string dev_id   = device_info.dev_id;
-    std::string model_id = device_info.model_id;
-
-    auto apply = [dev_id, model_id, ams_count, max_lane_index, trays]() {
-    // Look up MachineObject via DeviceManager
-    auto* dev_manager = GUI::wxGetApp().getDeviceManager();
-    if (!dev_manager) {
-        return;
+void MoonrakerPrinterAgent::build_ams_payload(int ams_count, int max_lane_index, const std::vector<AmsTrayData>& trays, const TrayInfoResolver& vendor_resolver)
+{
+    QueueOnMainFn queue_fn;
+    {
+        std::lock_guard<std::recursive_mutex> lock(state_mutex);
+        queue_fn = queue_on_main_fn;
     }
-    MachineObject* obj = dev_manager->get_my_machine(dev_id);
-    if (!obj) {
-        return;
-    }
-
-    // Build BBL-format JSON for DevFilaSystemParser::ParseV1_0
-    nlohmann::json ams_json = nlohmann::json::object();
-    nlohmann::json ams_array = nlohmann::json::array();
-
-    // Calculate ams_exist_bits and tray_exist_bits
-    unsigned long ams_exist_bits = 0;
-    unsigned long tray_exist_bits = 0;
-
-    for (int ams_id = 0; ams_id < ams_count; ++ams_id) {
-        ams_exist_bits |= (1 << ams_id);
-
-        nlohmann::json ams_unit = nlohmann::json::object();
-        ams_unit["id"] = std::to_string(ams_id);
-        ams_unit["info"] = "0002";  // treat as AMS_LITE 
-
-        nlohmann::json tray_array = nlohmann::json::array();
-        int max_slot_in_this_ams = std::min(3, max_lane_index - ams_id * 4);
-        for (int slot_id = 0; slot_id <= max_slot_in_this_ams; ++slot_id) {
-            int slot_index = ams_id * 4 + slot_id;
-
-            // Find tray with matching slot_index
-            const AmsTrayData* tray = nullptr;
-            for (const auto& t : trays) {
-                if (t.slot_index == slot_index) {
-                    tray = &t;
-                    break;
-                }
-            }
-
-            nlohmann::json tray_json = nlohmann::json::object();
-            tray_json["id"] = std::to_string(slot_id);
-            tray_json["tag_uid"] = "0000000000000000";
-
-            if (tray && tray->has_filament) {
-                tray_exist_bits |= (1 << slot_index);
-
-                tray_json["tray_info_idx"] = tray->tray_info_idx;
-                tray_json["tray_type"] = tray->tray_type;
-                tray_json["tray_color"] = normalize_color_value(tray->tray_color);
-
-                // Add temperature data if provided
-                if (tray->bed_temp > 0) {
-                    tray_json["bed_temp"] = std::to_string(tray->bed_temp);
-                }
-                if (tray->nozzle_temp > 0) {
-                    tray_json["nozzle_temp_max"] = std::to_string(tray->nozzle_temp);
-                }
-            } else {
-                tray_json["tray_info_idx"] = "";
-                tray_json["tray_type"] = "";
-                tray_json["tray_color"] = "00000000";
-                tray_json["tray_slot_placeholder"] = "1";
-            }
-
-            tray_array.push_back(tray_json);
-        }
-        ams_unit["tray"] = tray_array;
-        ams_array.push_back(ams_unit);
-    }
-
-    // Format as hex strings (matching BBL protocol)
-    std::ostringstream ams_exist_ss;
-    ams_exist_ss << std::hex << std::uppercase << ams_exist_bits;
-    std::ostringstream tray_exist_ss;
-    tray_exist_ss << std::hex << std::uppercase << tray_exist_bits;
-
-    ams_json["ams"] = ams_array;
-    ams_json["ams_exist_bits"] = ams_exist_ss.str();
-    ams_json["tray_exist_bits"] = tray_exist_ss.str();
-
-    // Wrap in the expected structure for ParseV1_0
-    nlohmann::json print_json = nlohmann::json::object();
-    print_json["ams"] = ams_json;
-
-    // Call the parser to populate DevFilaSystem
-    DevFilaSystemParser::ParseV1_0(print_json, obj, obj->GetFilaSystem().get(), false);
-    BOOST_LOG_TRIVIAL(info) << "MoonrakerPrinterAgent::build_ams_payload: Parsed " << trays.size() << " trays";
-
-    // Set printer_type so update_sync_status() can match it against the preset's printer type.
-    // Without this, the comparison fails and all sync badges are cleared.
-    obj->printer_type = model_id;
-
-    // Set push counters so is_info_ready() returns true for pull-mode agents.
-    if (obj->m_push_count == 0) {
-        obj->m_push_count = 1;
-    }
-    if (obj->m_full_msg_count == 0) {
-        obj->m_full_msg_count = 1;
-    }
-    obj->last_push_time = std::chrono::system_clock::now();
-
-    // Set storage state - Moonraker printers use virtual_sdcard, storage is always available.
-    // This is required for SelectMachineDialog to allow printing (otherwise it blocks with "No SD card").
-    obj->GetStorage()->set_sdcard_state(DevStorage::HAS_SDCARD_NORMAL);
-
-    // Populate module_vers so is_info_ready() passes the version check.
-    // Moonraker printers don't have BBL-style version info, but we need a non-empty map.
-    if (obj->module_vers.empty()) {
-        DevFirmwareVersionInfo ota_info;
-        ota_info.name = "ota";
-        ota_info.sw_ver = "1.0.0";  // Placeholder version for Moonraker printers
-        obj->module_vers.emplace("ota", ota_info);
-    }
-    };
-
-    if (queue_fn) {
-        queue_fn(apply);
-    } else {
-        apply();
-    }
+    build_ams_payload_for_device(device_info.dev_id, std::optional<std::string>(device_info.model_id), ams_count, max_lane_index, trays, queue_fn, vendor_resolver);
 }
 
 bool MoonrakerPrinterAgent::fetch_filament_info(std::string dev_id, FilamentSyncMode sync_mode)
@@ -764,94 +649,7 @@ std::string MoonrakerPrinterAgent::trim_and_upper(const std::string& input)
     return result;
 }
 
-std::string MoonrakerPrinterAgent::map_filament_type_to_generic_id(const std::string& filament_type)
-{
-    const std::string upper = trim_and_upper(filament_type);
-
-    // Normalize reported material names (trimmed, uppercased) to an OrcaFilamentLibrary
-    // generic family. The family's filament_id is resolved from the loaded system presets
-    // below rather than hardcoded, so profile id re-mints never require touching this table.
-    // scripts/test_moonraker_lane_data.py parses this initializer; keep the {"A", "B"} format.
-    static const std::map<std::string, std::string> type_to_ofl_family = {
-        // PLA variants
-        {"PLA", "PLA"},
-        {"PLA-CF", "PLA-CF"},
-        {"PLA SILK", "PLA Silk"},
-        {"PLA-SILK", "PLA Silk"},
-        {"PLA HIGH SPEED", "PLA High Speed"},
-        {"PLA-HS", "PLA High Speed"},
-        {"PLA HS", "PLA High Speed"},
-
-        // ABS/ASA variants
-        {"ABS", "ABS"},
-        {"ASA", "ASA"},
-
-        // PETG/PET variants
-        {"PETG", "PETG"},
-        {"PET", "PETG"},
-        {"PCTG", "PCTG"},
-
-        // PA/Nylon variants
-        {"PA", "PA"},
-        {"NYLON", "PA"},
-        {"PA-CF", "PA-CF"},
-        {"PPA", "PPA-CF"},
-        {"PPA-CF", "PPA-CF"},
-        {"PPA-GF", "PPA-GF"},
-
-        // PC variants
-        {"PC", "PC"},
-
-        // PP/PE variants
-        {"PE", "PE"},
-        {"PP", "PP"},
-
-        // Support materials
-        {"PVA", "PVA"},
-        {"HIPS", "HIPS"},
-        {"BVOH", "BVOH"},
-
-        // TPU variants
-        {"TPU", "TPU"},
-
-        // Other materials
-        {"EVA", "EVA"},
-        {"PHA", "PHA"},
-        {"COPE", "CoPE"},
-        {"SBS", "SBS"},
-    };
-
-    auto it = type_to_ofl_family.find(upper);
-    if (it == type_to_ofl_family.end())
-        return UNKNOWN_FILAMENT_ID;
-
-    if (auto* bundle = GUI::wxGetApp().preset_bundle) {
-        const Preset* preset = bundle->filaments.find_preset("Generic " + it->second + " @System");
-        if (preset != nullptr && preset->is_system && !preset->filament_id.empty())
-            return preset->filament_id;
-    }
-
-    // Unknown material, or no loaded preset data to resolve against
-    return UNKNOWN_FILAMENT_ID;
-}
-
 // JSON helper methods - null-safe accessors
-std::string MoonrakerPrinterAgent::safe_json_string(const nlohmann::json& obj, const char* key)
-{
-    auto it = obj.find(key);
-    if (it != obj.end() && it->is_string())
-        return it->get<std::string>();
-    return "";
-}
-
-int MoonrakerPrinterAgent::safe_json_int(const nlohmann::json& obj, const char* key)
-{
-    auto it = obj.find(key);
-    if (it != obj.end() && it->is_number())
-        return it->get<int>();
-    return 0;
-}
-
 std::string MoonrakerPrinterAgent::safe_array_string(const nlohmann::json& arr, int idx)
 {
     if (arr.is_array() && idx >= 0 && idx < static_cast<int>(arr.size()) && arr[idx].is_string())
@@ -864,41 +662,6 @@ int MoonrakerPrinterAgent::safe_array_int(const nlohmann::json& arr, int idx)
     if (arr.is_array() && idx >= 0 && idx < static_cast<int>(arr.size()) && arr[idx].is_number())
         return arr[idx].get<int>();
     return 0;
-}
-
-std::string MoonrakerPrinterAgent::normalize_color_value(const std::string& color)
-{
-    std::string value = color;
-    boost::trim(value);
-
-    // Remove 0x or 0X prefix if present
-    if (value.size() >= 2 && (value.rfind("0x", 0) == 0 || value.rfind("0X", 0) == 0)) {
-        value = value.substr(2);
-    }
-    // Remove # prefix if present
-    if (!value.empty() && value[0] == '#') {
-        value = value.substr(1);
-    }
-
-    // Extract only hex digits
-    std::string normalized;
-    for (char c : value) {
-        if (std::isxdigit(static_cast<unsigned char>(c))) {
-            normalized.push_back(static_cast<char>(std::toupper(static_cast<unsigned char>(c))));
-        }
-    }
-
-    // If 6 hex digits, add FF alpha
-    if (normalized.size() == 6) {
-        normalized += "FF";
-    }
-
-    // Validate length - return default if invalid
-    if (normalized.size() != 8) {
-        return "00000000";
-    }
-
-    return normalized;
 }
 
 // Fetch filament info from moonraker database
@@ -945,56 +708,11 @@ bool MoonrakerPrinterAgent::fetch_moonraker_filament_data(std::vector<AmsTrayDat
     }
 
     // Expected structure: { "result": { "namespace": "lane_data", "value": { "lane1": {...}, ... } } }
-    if (!json.contains("result") || !json["result"].contains("value") || !json["result"]["value"].is_object()) {
-        BOOST_LOG_TRIVIAL(warning) << "MoonrakerPrinterAgent::fetch_moonraker_filament_data: Unexpected JSON structure or no lane_data found";
+    if (!parse_moonraker_lane_data(json, trays, max_lane_index)) {
         return false;
     }
-
-    // Parse response into AmsTrayData
-    const auto& value = json["result"]["value"];
-    trays.clear();
-    max_lane_index = 0;
-
-    for (const auto& [lane_key, lane_obj] : value.items()) {
-        if (!lane_obj.is_object()) {
-            continue;
-        }
-
-        // Extract lane index from the "lane" field (tool number, 0-based)
-        std::string lane_str = safe_json_string(lane_obj, "lane");
-        int lane_index = -1;
-        if (!lane_str.empty()) {
-            try {
-                lane_index = std::stoi(lane_str);
-            } catch (...) {
-                lane_index = -1;
-            }
-        }
-
-        if (lane_index < 0) {
-            continue;
-        }
-
-        AmsTrayData tray;
-        tray.slot_index = lane_index;
-        tray.tray_color = safe_json_string(lane_obj, "color");
-        tray.tray_type = safe_json_string(lane_obj, "material");
-        tray.bed_temp = safe_json_int(lane_obj, "bed_temp");
-        tray.nozzle_temp = safe_json_int(lane_obj, "nozzle_temp");
-        tray.has_filament = !tray.tray_type.empty();
-        auto* bundle = GUI::wxGetApp().preset_bundle;
-        tray.tray_info_idx = bundle
-            ? bundle->filaments.filament_id_by_type(tray.tray_type)
-            : map_filament_type_to_generic_id(tray.tray_type);
-
-        max_lane_index = std::max(max_lane_index, lane_index);
-        trays.push_back(tray);
-    }
-
-    if (trays.empty()) {
-        BOOST_LOG_TRIVIAL(info) << "MoonrakerPrinterAgent::fetch_moonraker_filament_data: No lanes found";
-        return false;
-    }
+    // tray_info_idx is resolved later, on the main thread, inside
+    // build_ams_payload_for_device.
 
     return true;
 }
@@ -1109,11 +827,6 @@ bool MoonrakerPrinterAgent::fetch_hh_filament_info(std::vector<AmsTrayData>& tra
         tray.nozzle_temp = nozzle_temp;
         tray.bed_temp = 0;  // HH doesn't provide bed temp in gate arrays
         tray.has_filament = true;
-
-        auto* bundle = GUI::wxGetApp().preset_bundle;
-        tray.tray_info_idx = bundle
-            ? bundle->filaments.filament_id_by_type(tray.tray_type)
-            : map_filament_type_to_generic_id(tray.tray_type);
 
         max_lane_index = std::max(max_lane_index, gate_idx);
         trays.push_back(tray);

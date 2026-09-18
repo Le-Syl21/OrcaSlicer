@@ -68,6 +68,136 @@ TEST_CASE("Moonraker parses nozzle diameter from raw config and tolerates missin
     CHECK(MoonrakerParserProbe::parse_nozzle_diameter(missing_response) == 0.0f);
 }
 
+// why: the lane_data projection is shared by Moonraker and OrcaSonar; the
+// parser is pure so it can be checked without a live printer or a GUI.
+TEST_CASE("unit: lane_data projection maps lanes into AMS trays", "[unit][moonraker]")
+{
+    const auto body = nlohmann::json::parse(R"({
+        "result": {
+            "namespace": "lane_data",
+            "value": {
+                "lane0": {"lane": "0", "material": "PLA", "color": "FF0000FF"},
+                "lane1": {"lane": "1"},
+                "lane2": {"lane": "not-a-number"},
+                "lane3": {"lane": "3", "material": "PETG", "color": "#00FF00", "nozzle_temp": 240}
+            }
+        }
+    })");
+
+    std::vector<AmsTrayData> trays;
+    int max_lane_index = -1;
+    REQUIRE(parse_moonraker_lane_data(body, trays, max_lane_index));
+    REQUIRE(trays.size() == 3);
+    CHECK(trays[0].slot_index == 0);
+    CHECK(trays[0].has_filament);
+    CHECK(trays[0].tray_type == "PLA");
+    CHECK(trays[0].tray_color == "FF0000FF");
+    CHECK(trays[1].slot_index == 1);
+    CHECK_FALSE(trays[1].has_filament);
+    CHECK(trays[1].tray_type.empty());
+    CHECK(trays[2].slot_index == 3);
+    CHECK(trays[2].nozzle_temp == 240);
+    CHECK(max_lane_index == 3);
+}
+
+TEST_CASE("unit: lane_data projection rejects malformed and empty responses", "[unit][moonraker]")
+{
+    std::vector<AmsTrayData> trays;
+    int max_lane_index = -1;
+    CHECK_FALSE(parse_moonraker_lane_data(nlohmann::json::object(), trays, max_lane_index));
+    CHECK_FALSE(parse_moonraker_lane_data(nlohmann::json::parse(R"({"result":{"value":{}}})"), trays, max_lane_index));
+    CHECK_FALSE(parse_moonraker_lane_data(
+        nlohmann::json::parse(R"({"result":{"value":{"lane0":{"lane":"x"},"lane1":42}}})"), trays, max_lane_index));
+}
+
+// why: OrcaSonar projects sensed presence separately from declared material, so a
+// loaded lane with no type must not collapse to "empty".
+TEST_CASE("unit: lane_data presence is independent of declared material", "[unit][moonraker]")
+{
+    const auto body = nlohmann::json::parse(R"({
+        "result": {"value": {
+            "lane0": {"lane": "0", "has_filament": true},
+            "lane1": {"lane": "1", "has_filament": false, "material": "PLA"},
+            "lane2": {"lane": "2", "loaded": true},
+            "lane3": {"lane": "3", "material": "ASA"}
+        }}
+    })");
+
+    std::vector<AmsTrayData> trays;
+    int max_lane_index = -1;
+    REQUIRE(parse_moonraker_lane_data(body, trays, max_lane_index));
+    REQUIRE(trays.size() == 4);
+
+    CHECK(trays[0].has_filament);
+    CHECK(trays[0].tray_type.empty());
+
+    CHECK_FALSE(trays[1].has_filament);
+    CHECK(trays[1].tray_type == "PLA");
+
+    CHECK(trays[2].has_filament);
+
+    CHECK(trays[3].has_filament);
+    CHECK(trays[3].tray_type == "ASA");
+}
+
+// why: the exist bits and per-slot placeholder flag drive the sidebar's occupied
+// vs empty rendering; the builder is pure so this needs no GUI.
+TEST_CASE("unit: AMS payload sets exist bits and omits placeholder for loaded lanes", "[unit][moonraker]")
+{
+    std::vector<AmsTrayData> trays = {
+        {0, true, "PLA", "FF0000FF", "", 0, 0},
+        {2, true, "", "", "", 0, 0},   // loaded but undeclared
+        {5, true, "PETG", "00FF00", "", 0, 0},
+    };
+    const auto ams = build_bbl_ams_json(trays, 2, 5);
+
+    // Units 0 and 1 exist; slots 0, 2 and 5 hold filament (0b100101).
+    CHECK(ams["ams_exist_bits"].get<std::string>() == "3");
+    CHECK(ams["tray_exist_bits"].get<std::string>() == "25");
+
+    const auto& u0 = ams["ams"][0]["tray"];
+    CHECK_FALSE(u0[0].contains("tray_slot_placeholder"));
+    CHECK(u0[1].contains("tray_slot_placeholder"));
+    CHECK_FALSE(u0[2].contains("tray_slot_placeholder"));
+    CHECK(u0[2]["tray_type"].get<std::string>() == "");
+    CHECK(u0[2]["tray_color"].get<std::string>() == "00000000");
+
+    const auto& u1 = ams["ams"][1]["tray"];
+    CHECK(u1[0].contains("tray_slot_placeholder"));           // slot 4 absent
+    CHECK_FALSE(u1[1].contains("tray_slot_placeholder"));     // slot 5 present
+    CHECK(u1[1]["tray_color"].get<std::string>() == "00FF00FF"); // 6-hex padded
+}
+
+// why: the exist-bits fields are 64-bit; multi-box rigs past lane 31 would be
+// corrupted by a 32-bit unsigned long shift on MSVC. Guards the 64-bit path.
+TEST_CASE("unit: AMS payload sets exist bits beyond 31 lanes", "[unit][moonraker]")
+{
+    std::vector<AmsTrayData> trays = {
+        {33, true, "PLA", "FF0000FF", "", 0, 0},
+    };
+    const auto ams = build_bbl_ams_json(trays, 9, 33);
+
+    CHECK(ams["ams_exist_bits"].get<std::string>() == "1FF");        // units 0..8
+    CHECK(ams["tray_exist_bits"].get<std::string>() == "200000000"); // 1 << 33
+
+    const auto& u8 = ams["ams"][8]["tray"];
+    CHECK_FALSE(u8[1].contains("tray_slot_placeholder")); // slot 33 present
+}
+
+// why: the sync mode keys off the printer's declared material system; a device
+// with no capability record must never read as AMS-capable.
+TEST_CASE("unit: AMS capability registry reports only declared material systems", "[unit][moonraker]")
+{
+    CHECK_FALSE(has_ams_capability("cap-none"));
+    register_ams_capability("cap-true", true);
+    CHECK(has_ams_capability("cap-true"));
+    register_ams_capability("cap-false", false);
+    CHECK_FALSE(has_ams_capability("cap-false"));
+    // Later replies overwrite: a removed material system must clear the flag.
+    register_ams_capability("cap-true", false);
+    CHECK_FALSE(has_ams_capability("cap-true"));
+}
+
 // why: these builders preserve the Bambu firmware dialect byte-for-byte, including its trailing space.
 TEST_CASE("unit: BBL AMS gcode builders preserve command bytes", "[unit][bbl]")
 {

@@ -24,7 +24,7 @@ NAMESPACE = "lane_data"
 
 # Repo-relative paths for the offline generic-map check
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-MOONRAKER_AGENT_CPP = os.path.join(REPO_ROOT, "src", "slic3r", "Utils", "MoonrakerPrinterAgent.cpp")
+AMS_PAYLOAD_CPP = os.path.join(REPO_ROOT, "src", "slic3r", "Utils", "AmsPayload.cpp")
 OFL_FILAMENT_DIR = os.path.join(REPO_ROOT, "resources", "profiles", "OrcaFilamentLibrary", "filament")
 LANE_KEYS = [f"lane{i}" for i in range(1, 9)]  # lane1-lane8
 MATERIALS = ["PLA", "ABS", "PETG", "ASA", "ASA Sparkle", "TPU", ""]
@@ -41,16 +41,16 @@ MATERIAL_TEMPS = {
 }
 
 def parse_cpp_type_map():
-    """Extract the normalized-type -> OFL generic family table from MoonrakerPrinterAgent.cpp.
+    """Extract the normalized-type -> OFL generic family table from AmsPayload.cpp.
 
-    Reads MoonrakerPrinterAgent::map_filament_type_to_generic_id's type_to_ofl_family
-    initializer so the check tracks the C++ normalization without a duplicated list.
+    Reads map_filament_type_to_generic_id's type_to_ofl_family initializer so the
+    check tracks the C++ normalization without a duplicated list.
     """
-    with open(MOONRAKER_AGENT_CPP, encoding="utf-8") as f:
+    with open(AMS_PAYLOAD_CPP, encoding="utf-8") as f:
         src = f.read()
     m = re.search(r"type_to_ofl_family\s*=\s*\{(.*?)\n\s*\};", src, re.DOTALL)
     if not m:
-        raise RuntimeError(f"type_to_ofl_family table not found in {MOONRAKER_AGENT_CPP}")
+        raise RuntimeError(f"type_to_ofl_family table not found in {AMS_PAYLOAD_CPP}")
     pairs = re.findall(r'\{\s*"([^"]+)"\s*,\s*"([^"]+)"\s*\}', m.group(1))
     if not pairs:
         raise RuntimeError("type_to_ofl_family table parsed empty")
